@@ -259,6 +259,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     issuedAccountsRef.current = issuedAccounts
   }, [issuedAccounts])
+  const cloudMembersRef = useRef<RosterMember[]>(INITIAL_MEMBERS)
   const deletedAccountIdsRef = useRef<Set<string>>(new Set(DEFAULT_DELETED_ACCOUNT_IDS))
 
   // Kiểm tra một chuỗi bất kỳ có nằm trong danh sách đã bị xóa không
@@ -329,13 +330,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       const data = await res.json()
 
-        // 1. Đồng bộ tombstones các tài khoản & thành viên đã xóa từ cloud
+        // 1. Đồng bộ tombstones các tài khoản đã xóa từ cloud (tách biệt với issac_deleted_member_codes)
         const cloudDeleted: string[] = []
         if (data.deletedAccountIds && Array.isArray(data.deletedAccountIds)) {
           cloudDeleted.push(...data.deletedAccountIds)
         }
-        if (data.deletedMemberCodes && Array.isArray(data.deletedMemberCodes)) {
-          cloudDeleted.push(...data.deletedMemberCodes)
+
+        if (data.members && Array.isArray(data.members) && data.members.length > 0) {
+          cloudMembersRef.current = data.members
         }
 
         if (cloudDeleted.length > 0) {
@@ -352,7 +354,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           try {
             const arr = Array.from(deletedAccountIdsRef.current)
             localStorage.setItem('issac_deleted_account_ids', JSON.stringify(arr))
-            localStorage.setItem('issac_deleted_member_codes', JSON.stringify(arr))
           } catch (e) {}
         }
 
@@ -597,7 +598,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         backoffUntil = Date.now() + 30000
       }
     }
-    const timer = setInterval(pollAccounts, 30000)
+    const timer = setInterval(pollAccounts, 10000)
 
     return () => {
       if (typeof document !== 'undefined') {
@@ -772,8 +773,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    // 1. Tìm kiếm trong danh sách thành viên chính thức CLB (48 thành viên)
-    const member = INITIAL_MEMBERS.find(
+    // 1. Tìm kiếm trong danh sách thành viên CLB (cả mặc định lẫn thành viên mới thêm/cập nhật từ Cloud)
+    const activeMemberList = cloudMembersRef.current.length > 0 ? cloudMembersRef.current : INITIAL_MEMBERS
+    const member = activeMemberList.find(
       (m) =>
         m.member_code.toLowerCase() === clean ||
         (m.student_id && m.student_id.toLowerCase() === clean) ||

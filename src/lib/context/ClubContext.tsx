@@ -530,11 +530,9 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       if (savedDeletedMemberCodes) {
         const parsed = JSON.parse(savedDeletedMemberCodes)
         if (Array.isArray(parsed)) {
-          // Bảo vệ các thành viên chính thức: Không bao giờ để mã thành viên chính thức bị xóa nhầm do thao tác xóa tài khoản
-          const protectedCodes = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
-          const validDeleted = parsed.filter((code: string) => !protectedCodes.has(code))
-          validDeleted.forEach((code: string) => deletedMemberCodesRef.current.add(code))
-          localStorage.setItem('issac_deleted_member_codes', JSON.stringify(validDeleted))
+          parsed.forEach((code: string) => {
+            if (code) deletedMemberCodesRef.current.add(code)
+          })
         }
       }
     } catch (e) {}
@@ -542,28 +540,19 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     try {
       const savedMembers = localStorage.getItem('issac_members_clean_v1')
       const savedProposals = localStorage.getItem('issac_proposals_clean_v1')
-      const validInitialCodeSet = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
       let initialMemberList: RosterMember[] = getActiveRosterMembers(INITIAL_MEMBERS)
       if (savedMembers) {
         try {
           const parsed = JSON.parse(savedMembers)
           if (Array.isArray(parsed) && parsed.length > 0) {
-            // Chuẩn hóa chỉ giữ lại các thành viên trong danh sách 47 thành viên chuẩn
-            const sanitized = parsed.filter((m: any) => m?.member_code && validInitialCodeSet.has(m.member_code))
-            if (sanitized.length === INITIAL_MEMBERS.length) {
-              initialMemberList = sanitized
-            } else if (sanitized.length > 0) {
-              const existingCodes = new Set(sanitized.map((m: any) => m.member_code))
-              const missingInitial = INITIAL_MEMBERS.filter((m) => !existingCodes.has(m.member_code))
-              initialMemberList = [...sanitized, ...missingInitial]
-            }
+            initialMemberList = parsed.filter((m: any) => Boolean(m?.member_code))
           }
         } catch (e) {}
       }
 
-      // Loại bỏ các thành viên ngoài danh sách hoặc đã xóa và nén/làm sạch avatar quá lớn
+      // Loại bỏ các thành viên đã xóa và nén/làm sạch avatar quá lớn
       initialMemberList = initialMemberList
-        .filter((m) => validInitialCodeSet.has(m.member_code) && !deletedMemberCodesRef.current.has(m.member_code))
+        .filter((m) => !deletedMemberCodesRef.current.has(m.member_code))
         .map((m) => {
           let avt = sanitizeMemberAvatar(m.avatar_url) || getMemberAvatarUrl(m) || undefined
           return {
@@ -572,11 +561,15 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
           }
         })
 
-      // Tự động bổ sung đầy đủ 47 thành viên trong danh sách chuẩn INITIAL_MEMBERS nếu thiết bị còn thiếu
-      const existingCodes = new Set(initialMemberList.map((m) => m.member_code))
-      const missingInitial = INITIAL_MEMBERS.filter((m) => !existingCodes.has(m.member_code))
-      if (missingInitial.length > 0) {
-        initialMemberList = [...initialMemberList, ...missingInitial]
+      // Tự động bổ sung thành viên mặc định nếu thiết bị chưa có và chưa bị xóa
+      if (!savedMembers) {
+        const existingCodes = new Set(initialMemberList.map((m) => m.member_code))
+        const missingInitial = INITIAL_MEMBERS.filter(
+          (m) => !existingCodes.has(m.member_code) && !deletedMemberCodesRef.current.has(m.member_code)
+        )
+        if (missingInitial.length > 0) {
+          initialMemberList = [...initialMemberList, ...missingInitial]
+        }
       }
       let initialProposalList: ProposalItem[] = []
       if (savedProposals) {
@@ -712,7 +705,13 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      }).catch((e) => console.error('Cloud sync notice:', e))
+      })
+        .then((res) => {
+          if (res.ok) {
+            broadcastSync('SYNC_TRIGGER')
+          }
+        })
+        .catch((e) => console.error('Cloud sync notice:', e))
     }
   }
 
@@ -833,11 +832,8 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
 
         // Hợp nhất Danh sách Thành viên & Điểm số (Khớp 100% giữa Mobile và Desktop, Chống nhảy lại dữ liệu)
         if (data.deletedMemberCodes && Array.isArray(data.deletedMemberCodes)) {
-          const protectedCodes = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
           data.deletedMemberCodes.forEach((code: string) => {
-            if (!protectedCodes.has(code)) {
-              deletedMemberCodesRef.current.add(code)
-            }
+            if (code) deletedMemberCodesRef.current.add(code)
           })
           try {
             localStorage.setItem(
@@ -848,12 +844,11 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (data.members && Array.isArray(data.members) && data.members.length > 0) {
-          const validInitialCodeSet = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
           const deletedCodes = deletedMemberCodesRef.current
-          // Lọc bỏ thành viên đã xóa khỏi cloud list và chuẩn hóa đúng 47 thành viên chuẩn
-          const safeCloudMembers = data.members.filter((m: any) => m?.member_code && validInitialCodeSet.has(m.member_code) && !deletedCodes.has(m.member_code))
+          // Giữ cả thành viên mới thêm từ cloud, chỉ lọc bỏ thành viên đã xóa
+          const safeCloudMembers = data.members.filter((m: any) => m?.member_code && !deletedCodes.has(m.member_code))
 
-          const currentMembers = membersRef.current.filter((m) => validInitialCodeSet.has(m.member_code) && !deletedCodes.has(m.member_code))
+          const currentMembers = membersRef.current.filter((m) => !deletedCodes.has(m.member_code))
           const curMap = new Map(currentMembers.map((m) => [m.member_code, m]))
           let hasLocalNewer = false
 
@@ -889,9 +884,9 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
             }
           })
 
-          // Giữ lại các thành viên mới tạo ở local mà cloud chưa kịp có (loại trừ đã xóa, nhưng phải trong danh sách chuẩn)
+          // Giữ lại các thành viên mới tạo ở local mà cloud chưa kịp có (loại trừ đã xóa)
           const cloudCodes = new Set(safeCloudMembers.map((m: any) => m.member_code))
-          const localOnlyMembers = currentMembers.filter((m) => !cloudCodes.has(m.member_code) && !deletedCodes.has(m.member_code) && validInitialCodeSet.has(m.member_code))
+          const localOnlyMembers = currentMembers.filter((m) => !cloudCodes.has(m.member_code) && !deletedCodes.has(m.member_code))
           if (localOnlyMembers.length > 0) {
             merged.push(...localOnlyMembers.map((m) => ({
               ...m,
@@ -900,12 +895,14 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
             hasLocalNewer = true
           }
 
-          // Bảo toàn tuyệt đối danh sách 47 thành viên chính thức INITIAL_MEMBERS
-          const mergedCodes = new Set(merged.map((m: any) => m.member_code))
-          const missingCore = INITIAL_MEMBERS.filter((m) => !mergedCodes.has(m.member_code) && !deletedCodes.has(m.member_code))
-          if (missingCore.length > 0) {
-            merged.push(...missingCore)
-            hasLocalNewer = true
+          // Chỉ bù thành viên mặc định nếu chưa có trong danh sách và chưa bị xóa
+          if (data.source !== 'supabase_cloud') {
+            const mergedCodes = new Set(merged.map((m: any) => m.member_code))
+            const missingCore = INITIAL_MEMBERS.filter((m) => !mergedCodes.has(m.member_code) && !deletedCodes.has(m.member_code))
+            if (missingCore.length > 0) {
+              merged.push(...missingCore)
+              hasLocalNewer = true
+            }
           }
 
           // Tự động chuẩn hóa điểm số thực tế từ sổ cái proposals cho chu kỳ đang kích hoạt
@@ -1018,7 +1015,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (data.customRules && Array.isArray(data.customRules)) {
-          if (data.customRules.length > 0 && JSON.stringify(data.customRules) !== JSON.stringify(customRulesRef.current)) {
+          if (JSON.stringify(data.customRules) !== JSON.stringify(customRulesRef.current)) {
             customRulesRef.current = data.customRules
             setCustomRules(data.customRules)
             try {
@@ -1075,8 +1072,8 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    // Tần suất polling định kỳ 15 giây khi tab đang mở nhẹ nhàng và tối ưu
-    const timer = setInterval(pollSync, 15000)
+    // Tần suất polling định kỳ 5 giây khi tab đang mở để đồng bộ gần như tức thời đa thiết bị
+    const timer = setInterval(pollSync, 5000)
 
     const handleVisibilityChange = () => {
       if (!document.hidden) {

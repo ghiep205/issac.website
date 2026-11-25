@@ -28,6 +28,22 @@ let cachedSurveyFeedbacks: any[] | null = null
 let cachedDeletedSurveyEventIds: string[] | null = null
 let cachedSurveyCustomQuestions: Record<string, any> | null = null
 
+async function loadSettingJson<T>(supabase: ReturnType<typeof createAdminClient>, key: string): Promise<T | null> {
+  try {
+    const { data, error } = await supabase
+      .from('settings')
+      .select('value')
+      .eq('key', key)
+      .maybeSingle()
+    if (!error && data?.value) {
+      return JSON.parse(data.value) as T
+    }
+  } catch (e) {
+    console.warn(`Supabase loadSettingJson(${key}) notice:`, e)
+  }
+  return null
+}
+
 // GET /api/db/sync — Lấy dữ liệu sự kiện & điểm danh mới nhất từ Supabase
 export async function GET(request: Request) {
   try {
@@ -324,15 +340,7 @@ export async function GET(request: Request) {
       const safePeriods = Array.from(periodMap.values())
 
       const activeDeletedAccountIds = new Set<string>((deletedAccountIdsFromDb || cachedDeletedAccountIds || []) as string[])
-      const rawDeletedMemberCodes = new Set<string>((deletedMemberCodesFromDb || cachedDeletedMemberCodes || []) as string[])
-      // Bảo vệ: Các thành viên chính thức trong INITIAL_MEMBERS không bao giờ bị xóa do nhầm lẫn ID tài khoản
-      const protectedMemberCodes = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
-      const activeDeletedMemberCodes = new Set<string>()
-      for (const code of rawDeletedMemberCodes) {
-        if (!protectedMemberCodes.has(code)) {
-          activeDeletedMemberCodes.add(code)
-        }
-      }
+      const activeDeletedMemberCodes = new Set<string>((deletedMemberCodesFromDb || cachedDeletedMemberCodes || []) as string[])
 
       let finalAccounts = accountsFromDb || cachedAccounts || INITIAL_ISSUED_ACCOUNTS
       if (Array.isArray(finalAccounts) && activeDeletedAccountIds.size > 0) {
@@ -346,16 +354,18 @@ export async function GET(request: Request) {
       }
       cachedAccounts = finalAccounts
 
-      // Bảo toàn và chuẩn hóa đúng 47 thành viên CLB
-      const validInitialCodeSet = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
+      // Giữ toàn bộ thành viên hiện có (bao gồm thành viên thêm mới) và loại bỏ thành viên đã xóa
       let finalMembers = membersFromDb || cachedMembers || INITIAL_MEMBERS
       if (Array.isArray(finalMembers)) {
-        // Lọc để đảm bảo đúng 47 thành viên chuẩn, loại bỏ các bản ghi dôi dư
-        finalMembers = finalMembers.filter((m: any) => m?.member_code && validInitialCodeSet.has(m.member_code))
-        // Đảm bảo không bị thất lạc thành viên nào do bộ nhớ đệm hay lỗi quota Supabase
+        finalMembers = finalMembers.filter(
+          (m: any) => m?.member_code && !activeDeletedMemberCodes.has(m.member_code)
+        )
+        // Chỉ bổ sung thành viên mặc định nếu chưa bị xóa và chưa có trong danh sách
         const existingCodes = new Set(finalMembers.map((m: any) => m.member_code))
-        const missingInitial = INITIAL_MEMBERS.filter((m) => !existingCodes.has(m.member_code))
-        if (missingInitial.length > 0) {
+        const missingInitial = INITIAL_MEMBERS.filter(
+          (m) => !existingCodes.has(m.member_code) && !activeDeletedMemberCodes.has(m.member_code)
+        )
+        if (missingInitial.length > 0 && !membersFromDb) {
           finalMembers = [...finalMembers, ...missingInitial]
         }
         finalMembers = finalMembers.map((m: any) => ({
@@ -576,10 +586,38 @@ export async function POST(request: Request) {
     const supabase = createAdminClient()
 
     let dbSuccess = false
-    let dbErrorMsg = null
+    let dbErrorMsg: string | null = null
+
+    const saveSetting = async (key: string, rawValue: string, description: string) => {
+      try {
+        const { error: upsertErr } = await supabase
+          .from('settings')
+          .upsert(
+            {
+              key,
+              value: rawValue,
+              description,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'key' }
+          )
+        if (upsertErr) {
+          dbErrorMsg = upsertErr.message
+          console.warn(`Supabase ${key} upsert notice:`, upsertErr.message)
+        } else {
+          dbSuccess = true
+        }
+      } catch (err: any) {
+        dbErrorMsg = err?.message || 'Database error'
+        console.warn(`Supabase ${key} catch notice:`, err)
+      }
+    }
 
     // 0. Quản lý danh sách ID bản ghi đã xóa (Tombstones để chống hồi sinh khi sync từ máy khác)
     if (deletedProposalIds !== undefined || (action === 'delete_proposal' && proposalId)) {
+      if (cachedDeletedProposalIds === null) {
+        cachedDeletedProposalIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_proposal_ids')
+      }
       const incomingDel = Array.isArray(deletedProposalIds) ? deletedProposalIds : []
       if (action === 'delete_proposal' && proposalId && !incomingDel.includes(proposalId)) {
         incomingDel.push(proposalId)
@@ -590,25 +628,18 @@ export async function POST(request: Request) {
       ])
       cachedDeletedProposalIds = Array.from(combinedDelSet)
 
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_deleted_proposal_ids',
-              value: JSON.stringify(cachedDeletedProposalIds),
-              description: 'Cloud synchronized deleted proposal IDs for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (delErr) {
-        console.warn('Supabase deleted proposals upsert notice:', delErr)
-      }
+      await saveSetting(
+        'issac_deleted_proposal_ids',
+        JSON.stringify(cachedDeletedProposalIds),
+        'Cloud synchronized deleted proposal IDs for iSSAC Web'
+      )
     }
 
     // 0.1 Quản lý danh sách ID sự kiện đã xóa (Tombstones để chống hồi sinh khi sync từ máy khác)
     if (deletedEventIds !== undefined || (action === 'delete_event' && eventId)) {
+      if (cachedDeletedEventIds === null) {
+        cachedDeletedEventIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_event_ids')
+      }
       const incomingDelEvt = Array.isArray(deletedEventIds) ? deletedEventIds : []
       if (action === 'delete_event' && eventId && !incomingDelEvt.includes(eventId)) {
         incomingDelEvt.push(eventId)
@@ -619,25 +650,18 @@ export async function POST(request: Request) {
       ])
       cachedDeletedEventIds = Array.from(combinedDelEvtSet)
 
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_deleted_event_ids',
-              value: JSON.stringify(cachedDeletedEventIds),
-              description: 'Cloud synchronized deleted event IDs for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (delEvtErr) {
-        console.warn('Supabase deleted events upsert notice:', delEvtErr)
-      }
+      await saveSetting(
+        'issac_deleted_event_ids',
+        JSON.stringify(cachedDeletedEventIds),
+        'Cloud synchronized deleted event IDs for iSSAC Web'
+      )
     }
 
     // 0.2 Quản lý danh sách ID chu kỳ thi đua đã xóa (Tombstones để chống hồi sinh chu kỳ đã xóa)
     if (deletedPeriodIds !== undefined || (action === 'delete_period' && periodId)) {
+      if (cachedDeletedPeriodIds === null) {
+        cachedDeletedPeriodIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_period_ids')
+      }
       if (action === 'delete_period' && periodId) {
         const set = new Set([...(cachedDeletedPeriodIds || []), periodId])
         cachedDeletedPeriodIds = Array.from(set)
@@ -649,6 +673,9 @@ export async function POST(request: Request) {
     // Nếu có danh sách periods được gửi lên (kể cả tạo mới hay cập nhật):
     // Mọi chu kỳ có trong periods đều PHẢI ĐƯỢC GỠ KHỎI cachedDeletedPeriodIds!
     if (periods !== undefined && Array.isArray(periods)) {
+      if (cachedDeletedPeriodIds === null) {
+        cachedDeletedPeriodIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_period_ids')
+      }
       const activePeriodIds = new Set(periods.map((p: any) => p?.id).filter(Boolean))
       if (cachedDeletedPeriodIds && cachedDeletedPeriodIds.length > 0) {
         cachedDeletedPeriodIds = cachedDeletedPeriodIds.filter((id) => !activePeriodIds.has(id))
@@ -656,25 +683,21 @@ export async function POST(request: Request) {
     }
 
     if (deletedPeriodIds !== undefined || (action === 'delete_period' && periodId) || (periods !== undefined && Array.isArray(periods))) {
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_deleted_period_ids',
-              value: JSON.stringify(cachedDeletedPeriodIds || []),
-              description: 'Cloud synchronized deleted period IDs for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (delPerErr) {
-        console.warn('Supabase deleted periods upsert notice:', delPerErr)
-      }
+      await saveSetting(
+        'issac_deleted_period_ids',
+        JSON.stringify(cachedDeletedPeriodIds || []),
+        'Cloud synchronized deleted period IDs for iSSAC Web'
+      )
     }
 
     // 0.3 Quản lý danh sách ID tài khoản đã xóa (Tombstones để đồng bộ nhất quán giữa Điện thoại và Máy tính)
     if (deletedAccountIds !== undefined || (action === 'delete_account' && accountId)) {
+      if (cachedDeletedAccountIds === null) {
+        cachedDeletedAccountIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_account_ids')
+      }
+      if (cachedAccounts === null) {
+        cachedAccounts = await loadSettingJson<any[]>(supabase, 'issac_issued_accounts_cloud')
+      }
       const incomingDelAcc = Array.isArray(deletedAccountIds) ? [...deletedAccountIds] : []
       if (action === 'delete_account' && accountId && !incomingDelAcc.includes(accountId)) {
         incomingDelAcc.push(accountId)
@@ -715,64 +738,36 @@ export async function POST(request: Request) {
         )
       }
 
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_deleted_account_ids',
-              value: JSON.stringify(cachedDeletedAccountIds),
-              description: 'Cloud synchronized deleted account IDs for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_deleted_member_codes',
-              value: JSON.stringify(cachedDeletedMemberCodes),
-              description: 'Cloud synchronized deleted member codes for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (delAccErr) {
-        console.warn('Supabase deleted accounts upsert notice:', delAccErr)
-      }
+      await saveSetting(
+        'issac_deleted_account_ids',
+        JSON.stringify(cachedDeletedAccountIds),
+        'Cloud synchronized deleted account IDs for iSSAC Web'
+      )
     }
 
     // 0.4 Quản lý danh sách Member Code đã xóa (Tombstones để chống hồi sinh khi sync từ thiết bị khác)
-    if (deletedMemberCodes !== undefined || (action === 'delete_member' && memberCode)) {
-      const incomingDel = Array.isArray(deletedMemberCodes) ? deletedMemberCodes : []
+    if (deletedMemberCodes !== undefined || (action === 'delete_member' && memberCode) || (action === 'add_member' && member?.member_code)) {
+      if (cachedDeletedMemberCodes === null) {
+        cachedDeletedMemberCodes = await loadSettingJson<string[]>(supabase, 'issac_deleted_member_codes')
+      }
+      const incomingDel = Array.isArray(deletedMemberCodes) ? [...deletedMemberCodes] : []
       if (action === 'delete_member' && memberCode && !incomingDel.includes(memberCode)) {
         incomingDel.push(memberCode)
       }
-      const protectedMemberCodes = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
       const combinedDelSet = new Set([
         ...(cachedDeletedMemberCodes || []),
         ...incomingDel,
       ])
-      // Tuyệt đối không để mã của thành viên chính thức rơi vào danh sách đã xóa
-      const sanitizedDel = Array.from(combinedDelSet).filter((c) => !protectedMemberCodes.has(c))
-      cachedDeletedMemberCodes = sanitizedDel
-
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_deleted_member_codes',
-              value: JSON.stringify(cachedDeletedMemberCodes),
-              description: 'Cloud synchronized deleted member codes for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (delMemErr) {
-        console.warn('Supabase deleted member codes upsert notice:', delMemErr)
+      if (action === 'add_member' && member?.member_code) {
+        combinedDelSet.delete(member.member_code)
       }
+      cachedDeletedMemberCodes = Array.from(combinedDelSet)
+
+      await saveSetting(
+        'issac_deleted_member_codes',
+        JSON.stringify(cachedDeletedMemberCodes),
+        'Cloud synchronized deleted member codes for iSSAC Web'
+      )
     }
 
     const shouldUpdateEvents = events !== undefined || action !== undefined
@@ -997,26 +992,22 @@ export async function POST(request: Request) {
       const mergedProposals = Array.from(propMap.values())
       cachedProposals = mergedProposals
 
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_proposals_cloud',
-              value: JSON.stringify(mergedProposals),
-              description: 'Cloud synchronized proposals for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (propErr) {
-        console.warn('Supabase proposals upsert notice:', propErr)
-      }
+      await saveSetting(
+        'issac_proposals_cloud',
+        JSON.stringify(mergedProposals),
+        'Cloud synchronized proposals for iSSAC Web'
+      )
     }
 
     if (members !== undefined || action === 'add_member' || action === 'delete_member') {
+      if (cachedMembers === null && members === undefined) {
+        cachedMembers = await loadSettingJson<any[]>(supabase, 'issac_members_cloud')
+      }
+      if (cachedDeletedMemberCodes === null) {
+        cachedDeletedMemberCodes = await loadSettingJson<string[]>(supabase, 'issac_deleted_member_codes')
+      }
       const activeDelMemSet = new Set(cachedDeletedMemberCodes || [])
-      let baseMembers = members !== undefined ? members : (cachedMembers || [])
+      let baseMembers = members !== undefined ? members : (cachedMembers || INITIAL_MEMBERS)
       if (!Array.isArray(baseMembers)) baseMembers = []
 
       if (action === 'delete_member' && memberCode) {
@@ -1032,43 +1023,26 @@ export async function POST(request: Request) {
         }
       }
 
-      // Filter out deleted members and sanitize oversized avatars
-      const validInitialCodeSet = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
-      let cleanMembers = baseMembers
-        .filter((m: any) => m?.member_code && validInitialCodeSet.has(m.member_code))
+      // Giữ cả thành viên mới thêm, chỉ loại bỏ các thành viên đã xóa và cắt avatar quá lớn
+      const cleanMembers = baseMembers
+        .filter((m: any) => m?.member_code && !activeDelMemSet.has(m.member_code))
         .map((m: any) => ({
           ...m,
           avatar_url: m.avatar_url && m.avatar_url.length > 40000 ? undefined : m.avatar_url,
         }))
 
-      // Đảm bảo không bị thất lạc thành viên chính thức
-      const existingCleanCodes = new Set(cleanMembers.map((m: any) => m.member_code))
-      const missingFromBase = INITIAL_MEMBERS.filter(
-        (m) => !existingCleanCodes.has(m.member_code)
-      )
-      if (missingFromBase.length > 0) {
-        cleanMembers = [...cleanMembers, ...missingFromBase]
-      }
-
       cachedMembers = cleanMembers
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_members_cloud',
-              value: JSON.stringify(cleanMembers),
-              description: 'Cloud synchronized members for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (memErr) {
-        console.warn('Supabase members upsert notice:', memErr)
-      }
+      await saveSetting(
+        'issac_members_cloud',
+        JSON.stringify(cleanMembers),
+        'Cloud synchronized members for iSSAC Web'
+      )
     }
 
     if (disputes !== undefined || action === 'create_dispute' || action === 'review_dispute' || action === 'resolve_dispute') {
+      if (cachedDisputes === null) {
+        cachedDisputes = await loadSettingJson<any[]>(supabase, 'issac_disputes_cloud')
+      }
       const dispMap = new Map<string, any>()
       const currentServerDisputes = cachedDisputes || []
       if (Array.isArray(currentServerDisputes)) {
@@ -1099,21 +1073,11 @@ export async function POST(request: Request) {
 
       const mergedDisputes = Array.from(dispMap.values())
       cachedDisputes = mergedDisputes
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_disputes_cloud',
-              value: JSON.stringify(mergedDisputes),
-              description: 'Cloud synchronized disputes for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (dispErr) {
-        console.warn('Supabase disputes upsert notice:', dispErr)
-      }
+      await saveSetting(
+        'issac_disputes_cloud',
+        JSON.stringify(mergedDisputes),
+        'Cloud synchronized disputes for iSSAC Web'
+      )
     }
 
     if (periods !== undefined) {
@@ -1122,97 +1086,47 @@ export async function POST(request: Request) {
         ? periods.filter((p: any) => p?.id && !activeDelPerSet.has(p.id))
         : periods
       cachedPeriods = cleanPeriods
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_periods_cloud',
-              value: JSON.stringify(cleanPeriods),
-              description: 'Cloud synchronized periods for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (perErr) {
-        console.warn('Supabase periods upsert notice:', perErr)
-      }
+      await saveSetting(
+        'issac_periods_cloud',
+        JSON.stringify(cleanPeriods),
+        'Cloud synchronized periods for iSSAC Web'
+      )
     }
 
     if (activePeriodId !== undefined) {
       cachedActivePeriodId = String(activePeriodId)
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_active_period_id',
-              value: String(activePeriodId),
-              description: 'Cloud synchronized active period ID for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (actErr) {
-        console.warn('Supabase active period upsert notice:', actErr)
-      }
+      await saveSetting(
+        'issac_active_period_id',
+        String(activePeriodId),
+        'Cloud synchronized active period ID for iSSAC Web'
+      )
     }
 
     if (activeEventId !== undefined) {
       cachedActiveEventId = String(activeEventId || '')
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_active_event_id',
-              value: String(activeEventId || ''),
-              description: 'Cloud synchronized active event ID for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (actEvtErr) {
-        console.warn('Supabase active event upsert notice:', actEvtErr)
-      }
+      await saveSetting(
+        'issac_active_event_id',
+        String(activeEventId || ''),
+        'Cloud synchronized active event ID for iSSAC Web'
+      )
     }
 
     if (customRules !== undefined) {
       cachedCustomRules = customRules
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_custom_rules_cloud',
-              value: JSON.stringify(customRules),
-              description: 'Cloud synchronized custom rules for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (ruleErr) {
-        console.warn('Supabase custom rules upsert notice:', ruleErr)
-      }
+      await saveSetting(
+        'issac_custom_rules_cloud',
+        JSON.stringify(customRules),
+        'Cloud synchronized custom rules for iSSAC Web'
+      )
     }
 
     if (customPeriodScores !== undefined) {
       cachedPeriodScores = customPeriodScores
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_custom_period_scores',
-              value: JSON.stringify(customPeriodScores),
-              description: 'Cloud synchronized period scores for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (scoreErr) {
-        console.warn('Supabase period scores upsert notice:', scoreErr)
-      }
+      await saveSetting(
+        'issac_custom_period_scores',
+        JSON.stringify(customPeriodScores),
+        'Cloud synchronized period scores for iSSAC Web'
+      )
     }
 
     if (accounts !== undefined) {
@@ -1221,63 +1135,39 @@ export async function POST(request: Request) {
         ? accounts.filter((a: any) => a?.id && !activeDelAccSet.has(a.id))
         : accounts
       cachedAccounts = cleanAccounts
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_issued_accounts_cloud',
-              value: JSON.stringify(cleanAccounts),
-              description: 'Cloud synchronized issued accounts for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (accErr) {
-        console.warn('Supabase accounts upsert notice:', accErr)
-      }
+      await saveSetting(
+        'issac_issued_accounts_cloud',
+        JSON.stringify(cleanAccounts),
+        'Cloud synchronized issued accounts for iSSAC Web'
+      )
     }
 
     if (activities !== undefined) {
       cachedActivities = activities
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_activities_cloud',
-              value: JSON.stringify(activities),
-              description: 'Cloud synchronized activities schedule for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (actListErr) {
-        console.warn('Supabase activities upsert notice:', actListErr)
-      }
+      await saveSetting(
+        'issac_activities_cloud',
+        JSON.stringify(activities),
+        'Cloud synchronized activities schedule for iSSAC Web'
+      )
     }
 
     if (schedulePendingRequests !== undefined) {
       cachedSchedulePendingRequests = schedulePendingRequests
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_schedule_pending_requests',
-              value: JSON.stringify(schedulePendingRequests),
-              description: 'Cloud synchronized schedule pending requests for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (reqErr) {
-        console.warn('Supabase schedule pending requests upsert notice:', reqErr)
-      }
+      await saveSetting(
+        'issac_schedule_pending_requests',
+        JSON.stringify(schedulePendingRequests),
+        'Cloud synchronized schedule pending requests for iSSAC Web'
+      )
     }
 
     // Xử lý danh sách ID sự kiện khảo sát đã xóa (Tombstones để chống hồi sinh khi sync từ thiết bị khác)
     if (deletedSurveyEventIds !== undefined || (action === 'delete_survey_event' && surveyEventId)) {
+      if (cachedDeletedSurveyEventIds === null) {
+        cachedDeletedSurveyEventIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_survey_event_ids')
+      }
+      if (cachedSurveyEvents === null) {
+        cachedSurveyEvents = await loadSettingJson<any[]>(supabase, 'issac_survey_events_cloud')
+      }
       const incomingDelSurvey = Array.isArray(deletedSurveyEventIds) ? deletedSurveyEventIds : []
       if (action === 'delete_survey_event' && surveyEventId && !incomingDelSurvey.includes(surveyEventId)) {
         incomingDelSurvey.push(surveyEventId)
@@ -1292,21 +1182,11 @@ export async function POST(request: Request) {
         cachedSurveyEvents = cachedSurveyEvents.filter((e: any) => !combinedDelSurveySet.has(e.id))
       }
 
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_deleted_survey_event_ids',
-              value: JSON.stringify(cachedDeletedSurveyEventIds),
-              description: 'Cloud synchronized deleted survey event IDs for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (delSurveyErr) {
-        console.warn('Supabase deleted survey events upsert notice:', delSurveyErr)
-      }
+      await saveSetting(
+        'issac_deleted_survey_event_ids',
+        JSON.stringify(cachedDeletedSurveyEventIds),
+        'Cloud synchronized deleted survey event IDs for iSSAC Web'
+      )
     }
 
     if (surveyEvents !== undefined) {
@@ -1316,62 +1196,35 @@ export async function POST(request: Request) {
         : surveyEvents
       cachedSurveyEvents = cleanSurveyEvents
 
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_survey_events_cloud',
-              value: JSON.stringify(cleanSurveyEvents),
-              description: 'Cloud synchronized survey events for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (surveyEvtErr) {
-        console.warn('Supabase survey events upsert notice:', surveyEvtErr)
-      }
+      await saveSetting(
+        'issac_survey_events_cloud',
+        JSON.stringify(cleanSurveyEvents),
+        'Cloud synchronized survey events for iSSAC Web'
+      )
     }
 
     if (surveyFeedbacks !== undefined) {
       cachedSurveyFeedbacks = surveyFeedbacks
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_survey_feedbacks_cloud',
-              value: JSON.stringify(surveyFeedbacks),
-              description: 'Cloud synchronized survey feedbacks for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (surveyFbErr) {
-        console.warn('Supabase survey feedbacks upsert notice:', surveyFbErr)
-      }
+      await saveSetting(
+        'issac_survey_feedbacks_cloud',
+        JSON.stringify(surveyFeedbacks),
+        'Cloud synchronized survey feedbacks for iSSAC Web'
+      )
     }
 
     if (surveyCustomQuestions !== undefined) {
+      if (cachedSurveyCustomQuestions === null) {
+        cachedSurveyCustomQuestions = await loadSettingJson<Record<string, any>>(supabase, 'issac_survey_custom_questions_cloud')
+      }
       cachedSurveyCustomQuestions = {
         ...(cachedSurveyCustomQuestions || {}),
         ...surveyCustomQuestions,
       }
-      try {
-        await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_survey_custom_questions_cloud',
-              value: JSON.stringify(cachedSurveyCustomQuestions),
-              description: 'Cloud synchronized survey custom questions for iSSAC Web',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-      } catch (surveyQuesErr) {
-        console.warn('Supabase survey custom questions upsert notice:', surveyQuesErr)
-      }
+      await saveSetting(
+        'issac_survey_custom_questions_cloud',
+        JSON.stringify(cachedSurveyCustomQuestions),
+        'Cloud synchronized survey custom questions for iSSAC Web'
+      )
     }
 
     return NextResponse.json({
