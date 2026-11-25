@@ -10,6 +10,7 @@ import {
   canUserAddOrProposeScore,
 } from './permissions'
 import type { RosterMember } from '@/lib/clubData'
+import { findIssuedAccountForLogin, normalizeAccountIdentity } from './accountSync'
 
 export interface AuthUser {
   id: string
@@ -498,11 +499,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   )
 
   // Tải và hợp nhất tài khoản đám mây (Chống mất tài khoản mới tạo và chống hồi sinh tài khoản đã xóa)
-  const fetchCloudAccounts = useCallback(async () => {
+  const fetchCloudAccounts = useCallback(async (): Promise<{
+    accounts: IssuedAccount[]
+    members: RosterMember[]
+  } | null> => {
     try {
       if (pendingAccountSyncRef.current) {
         await pendingAccountSyncRef.current
+      } else if (unsyncedLocalAccountsRef.current.size > 0) {
+        const pendingEntries = Array.from(unsyncedLocalAccountsRef.current.values()).map((e) => e.account)
+        if (pendingEntries.length > 0) {
+          const primary = pendingEntries[0]
+          await syncAccountsToCloud({
+            action: 'create_account',
+            account: primary,
+            accounts: pendingEntries,
+            unblockAccountIdentities: [
+              primary.id,
+              primary.email,
+              primary.studentId || '',
+              primary.fullName,
+            ].filter(Boolean),
+          })
+        }
       }
+
+      const fetchStartedAt = Date.now()
       const res = await fetch('/api/db/sync', {
         cache: 'no-store',
         headers: {
@@ -511,7 +533,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         },
       })
       if (!res.ok) {
-        return
+        return null
+      }
+      if (lastLocalAccountMutationAtRef.current > fetchStartedAt) {
+        // Có thao tác tạo/sửa/xóa tài khoản mới hơn xảy ra trong lúc đang GET -> bỏ qua response cũ này
+        return null
       }
       const data = await res.json()
 
@@ -626,16 +652,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
 
         nextCleanAccounts = Array.from(mergedMap.values()).filter((a) => !isEntityDeleted(a))
-        setIssuedAccounts((prev) => {
-          issuedAccountsRef.current = nextCleanAccounts
-          if (JSON.stringify(nextCleanAccounts) === JSON.stringify(prev)) {
-            return prev
-          }
+        // Cập nhật Ref & localStorage đồng bộ NGAY LẬP TỨC (không đặt bên trong setState updater của React 19)
+        const accountsChanged = JSON.stringify(nextCleanAccounts) !== JSON.stringify(issuedAccountsRef.current)
+        issuedAccountsRef.current = nextCleanAccounts
+        if (accountsChanged) {
           try {
             localStorage.setItem('issac_issued_accounts', JSON.stringify(nextCleanAccounts))
           } catch {}
-          return nextCleanAccounts
-        })
+          setIssuedAccounts(nextCleanAccounts)
+        }
 
         // Nếu còn tài khoản local chưa lên được Cloud (do lỗi mạng / cold-start), tự đẩy lại mỗi 10s
         if (
@@ -658,18 +683,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           })
         }
       } else {
-        setIssuedAccounts((prev) => {
-          const clean = prev.filter((a) => !isEntityDeleted(a))
-          issuedAccountsRef.current = clean
-          nextCleanAccounts = clean
-          if (clean.length === prev.length) {
-            return prev
-          }
+        const clean = issuedAccountsRef.current.filter((a) => !isEntityDeleted(a))
+        const changed = clean.length !== issuedAccountsRef.current.length
+        issuedAccountsRef.current = clean
+        nextCleanAccounts = clean
+        if (changed) {
           try {
             localStorage.setItem('issac_issued_accounts', JSON.stringify(clean))
           } catch {}
-          return clean
-        })
+          setIssuedAccounts(clean)
+        }
       }
 
       // 3. FORCE LOGOUT & LIVE ROLE SYNC REAL-TIME TRÊN TẤT CẢ THIẾT BỊ:
@@ -760,8 +783,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         return current
       })
+      return { accounts: nextCleanAccounts, members: latestMembers }
     } catch {
       // Offline fallback
+      return null
     }
   }, [isEntityDeleted, isIdentityDeleted, syncAccountsToCloud])
 
@@ -1291,7 +1316,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return { success: true, message: 'Đã xóa tài khoản thành công!', syncPromise }
   }
 
-  const login = (accountInput: string, passwordInput?: string) => {
+  const login = (
+    accountInput: string,
+    passwordInput?: string,
+    snapshot?: { accounts?: IssuedAccount[]; members?: RosterMember[] } | null
+  ) => {
     const clean = accountInput.trim().toLowerCase()
     if (!clean) {
       return { success: false, message: 'Vui lòng nhập Email sinh viên hoặc Mã số sinh viên (MSSV).' }
@@ -1311,46 +1340,44 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     // 1. Tìm kiếm trong danh sách thành viên CLB (cả mặc định lẫn thành viên mới thêm/cập nhật từ Cloud)
-    const activeMemberList = cloudMembersRef.current.length > 0 ? cloudMembersRef.current : INITIAL_MEMBERS
+    const activeMemberList =
+      snapshot?.members && snapshot.members.length > 0
+        ? snapshot.members
+        : cloudMembersRef.current.length > 0
+          ? cloudMembersRef.current
+          : INITIAL_MEMBERS
     const member = activeMemberList.find(
       (m) =>
-        m.member_code.toLowerCase() === clean ||
-        (m.student_id && m.student_id.toLowerCase() === clean) ||
-        m.email.toLowerCase() === clean ||
-        m.full_name.toLowerCase() === clean
+        normalizeAccountIdentity(m.member_code) === clean ||
+        normalizeAccountIdentity(m.student_id) === clean ||
+        normalizeAccountIdentity(m.email) === clean ||
+        normalizeAccountIdentity(m.full_name) === clean
     )
 
     // 2. Tìm kiếm trong danh sách tài khoản được cấp (issuedAccounts):
-    //    Ưu tiên email/id khớp trực tiếp, sau đó MSSV cá nhân (tránh nhầm acc-master dùng STAFF-001 với thành viên STAFF-001)
-    const currentIssuedList = issuedAccountsRef.current.length > 0 ? issuedAccountsRef.current : issuedAccounts
+    const currentIssuedList =
+      snapshot?.accounts && snapshot.accounts.length > 0
+        ? snapshot.accounts
+        : issuedAccountsRef.current.length > 0
+          ? issuedAccountsRef.current
+          : issuedAccounts
     const activeIssued = currentIssuedList.filter((a) => !isEntityDeleted(a))
-    const memberStudentClean = member?.student_id?.trim().toLowerCase()
-    const memberCodeClean = member?.member_code?.trim().toLowerCase()
-    const issued =
-      activeIssued.find((a) => a.email.toLowerCase() === clean || a.id.toLowerCase() === clean) ||
-      activeIssued.find(
-        (a) =>
-          !a.isFixed &&
-          ((a.studentId && a.studentId.toLowerCase() === clean) ||
-            (member &&
-              a.studentId &&
-              a.studentId.toUpperCase() !== 'STAFF-001' &&
-              (a.studentId.toLowerCase() === memberStudentClean ||
-                a.studentId.toLowerCase() === memberCodeClean)) ||
-            (member && a.email && a.email.toLowerCase() === member.email.toLowerCase()) ||
-            a.fullName.toLowerCase() === clean)
-      ) ||
-      activeIssued.find(
-        (a) =>
-          (a.studentId && a.studentId.toUpperCase() !== 'STAFF-001' && a.studentId.toLowerCase() === clean) ||
-          (member &&
-            a.studentId &&
-            a.studentId.toUpperCase() !== 'STAFF-001' &&
-            (a.studentId.toLowerCase() === memberStudentClean ||
-              a.studentId.toLowerCase() === memberCodeClean)) ||
-          (member && a.email && a.email.toLowerCase() === member.email.toLowerCase()) ||
-          a.fullName.toLowerCase() === clean
-      )
+    const issued = findIssuedAccountForLogin({
+      activeIssued,
+      cleanInput: clean,
+      member,
+    })
+
+    // Nếu người dùng đăng nhập bằng Email mới của tài khoản được cấp và tài khoản có gắn MSSV -> liên kết hồ sơ thành viên tương ứng
+    const resolvedMember =
+      member ||
+      (issued?.studentId && issued.studentId.toUpperCase() !== 'STAFF-001'
+        ? activeMemberList.find(
+            (m) =>
+              normalizeAccountIdentity(m.student_id) === normalizeAccountIdentity(issued.studentId) ||
+              normalizeAccountIdentity(m.member_code) === normalizeAccountIdentity(issued.studentId)
+          )
+        : undefined)
 
     // 3. Tìm kiếm trong tài khoản cài sẵn (preset)
     const preset = PRESET_USERS.find(
@@ -1358,14 +1385,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         !isEntityDeleted(u) &&
         (u.id.toLowerCase() === clean ||
           u.memberCode?.toLowerCase() === clean ||
-          (member && u.memberCode?.toLowerCase() === member.member_code.toLowerCase()) ||
+          (resolvedMember && u.memberCode?.toLowerCase() === resolvedMember.member_code.toLowerCase()) ||
           u.name.toLowerCase() === clean)
     )
 
     // BƯỚC 2: KIỂM TRA THỰC THỂ TÌM THẤY CÓ BỊ XÓA HOẶC KHÓA KHÔNG
     if (
       (issued && isEntityDeleted(issued)) ||
-      (member && isEntityDeleted(member)) ||
+      (resolvedMember && isEntityDeleted(resolvedMember)) ||
       (preset && isEntityDeleted(preset))
     ) {
       return {
@@ -1381,7 +1408,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    if (!issued && !preset && !member) {
+    if (!issued && !preset && !resolvedMember) {
       return {
         success: false,
         message: 'Không tìm thấy tài khoản trong hệ thống. Vui lòng kiểm tra lại Email sinh viên hoặc MSSV của bạn.',
@@ -1396,23 +1423,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     validPasswords.add('ISSAC2026@clb')
 
     if (issued?.passwordPlain) {
-      validPasswords.add(issued.passwordPlain)
-      validPasswords.add(issued.passwordPlain.trim())
+      const pStr = String(issued.passwordPlain)
+      validPasswords.add(pStr)
+      validPasswords.add(pStr.trim())
     }
     if (issued?.studentId) {
       validPasswords.add(issued.studentId)
       validPasswords.add(`ISSAC2026@${issued.studentId}`)
     }
-    if (member?.student_id) {
-      validPasswords.add(member.student_id)
-      validPasswords.add(`ISSAC2026@${member.student_id}`)
+    if (resolvedMember?.student_id) {
+      validPasswords.add(resolvedMember.student_id)
+      validPasswords.add(`ISSAC2026@${resolvedMember.student_id}`)
     }
-    if (member?.member_code) {
-      validPasswords.add(member.member_code)
-      validPasswords.add(`ISSAC2026@${member.member_code}`)
+    if (resolvedMember?.member_code) {
+      validPasswords.add(resolvedMember.member_code)
+      validPasswords.add(`ISSAC2026@${resolvedMember.member_code}`)
     }
-    if (member?.phone) {
-      validPasswords.add(member.phone)
+    if (resolvedMember?.phone) {
+      validPasswords.add(resolvedMember.phone)
     }
 
     const isCorrectPassword = validPasswords.has(cleanPass)
@@ -1424,7 +1452,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    const authUser = resolveAuthUserSession({ issued, member, preset })
+    const authUser = resolveAuthUserSession({ issued, member: resolvedMember, preset })
 
     setCurrentUser(authUser)
     try {
@@ -1440,8 +1468,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const loginWithSync = async (accountInput: string, passwordInput?: string) => {
     // Đồng bộ danh sách tài khoản mới nhất từ Cloud trước khi xác thực để tài khoản vừa tạo ở thiết bị khác đăng nhập được ngay
-    await fetchCloudAccounts()
-    return login(accountInput, passwordInput)
+    const snapshot = await fetchCloudAccounts()
+    return login(accountInput, passwordInput, snapshot)
   }
 
   const logout = () => {
@@ -1504,7 +1532,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         createIssuedAccount,
         updateIssuedAccount,
         deleteIssuedAccount,
-        refreshCloudAccounts: fetchCloudAccounts,
+        refreshCloudAccounts: async () => {
+          await fetchCloudAccounts()
+        },
         cloudSyncError,
         isBCN,
         isHR,

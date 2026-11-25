@@ -4,6 +4,11 @@ import { AVAILABLE_PERIODS } from '@/lib/periodData'
 import { INITIAL_MEMBERS } from '@/lib/clubData'
 import { INITIAL_ISSUED_ACCOUNTS } from '@/lib/auth/accountData'
 import { INITIAL_ACTIVITIES } from '@/lib/scheduleData'
+import {
+  isAccountDeletedBySet,
+  dedupeAccounts,
+  mergeIssuedAccountsList,
+} from '@/lib/auth/accountSync'
 
 const NO_STORE_HEADERS = {
   'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
@@ -35,53 +40,6 @@ let cachedSurveyFeedbacks: any[] | null = null
 let cachedDeletedSurveyEventIds: string[] | null = null
 let cachedSurveyCustomQuestions: Record<string, any> | null = null
 let cachedBcnSurveyNotes: Record<string, string> | null = null
-
-function isAccountDeletedBySet(acc: any, delSet: Set<string>): boolean {
-  if (!acc || delSet.size === 0) return false
-  const lowerDel = new Set<string>()
-  delSet.forEach((v) => {
-    if (v) lowerDel.add(String(v).toLowerCase().trim())
-  })
-  const candidates = [acc.id, acc.studentId, acc.memberCode, acc.email]
-  if (candidates.some((val) => val && lowerDel.has(String(val).toLowerCase().trim()))) {
-    return true
-  }
-  const fullNameClean = String(acc.fullName || acc.name || '').toLowerCase().trim()
-  if ((fullNameClean === 'trần đức thắng' || fullNameClean === 'tran duc thang') && lowerDel.has(fullNameClean)) {
-    return true
-  }
-  return false
-}
-
-function normalizeAccountIdentity(value?: string | null): string {
-  return String(value || '').toLowerCase().trim()
-}
-
-function dedupeAccounts(list: any[]): any[] {
-  const seenIds = new Set<string>()
-  const seenEmails = new Set<string>()
-  const seenStudentIds = new Set<string>()
-  const result: any[] = []
-
-  for (const acc of list) {
-    if (!acc || typeof acc !== 'object') continue
-    const id = String(acc.id || '').trim()
-    if (!id || seenIds.has(id)) continue
-
-    const emailKey = normalizeAccountIdentity(acc.email)
-    if (emailKey && seenEmails.has(emailKey)) continue
-
-    const studentKey = normalizeAccountIdentity(acc.studentId)
-    if (studentKey && studentKey !== 'staff-001' && seenStudentIds.has(studentKey)) continue
-
-    seenIds.add(id)
-    if (emailKey) seenEmails.add(emailKey)
-    if (studentKey && studentKey !== 'staff-001') seenStudentIds.add(studentKey)
-    result.push(acc)
-  }
-
-  return result
-}
 
 function getTimestampMs(val: unknown): number {
   if (typeof val === 'number' && Number.isFinite(val)) return val
@@ -1554,15 +1512,8 @@ export async function POST(request: Request) {
         cachedAccounts = await loadSettingJson<any[]>(supabase, 'issac_issued_accounts_cloud')
       }
       const activeDelAccSet = new Set(cachedDeletedAccountIds || [])
-      const accMap = new Map<string, any>()
       const existingAccs =
-        cachedAccounts !== null ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
-      const existingById = new Map<string, any>()
-      for (const a of existingAccs) {
-        if (a?.id && !isAccountDeletedBySet(a, activeDelAccSet)) {
-          existingById.set(a.id, a)
-        }
-      }
+        Array.isArray(cachedAccounts) && cachedAccounts.length > 0 ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
 
       const incomingAccountsList: any[] = []
       if (account && typeof account === 'object') {
@@ -1572,32 +1523,12 @@ export async function POST(request: Request) {
         incomingAccountsList.push(...accounts)
       }
 
-      // Đưa tài khoản mới tạo / cập nhật từ client lên đầu danh sách để đồng bộ thứ tự nhất quán giữa các thiết bị
-      for (const a of incomingAccountsList) {
-        if (!a?.id || isAccountDeletedBySet(a, activeDelAccSet)) continue
-        const prev = existingById.get(a.id)
-        const already = accMap.get(a.id)
-        const base = already || prev
-        if (!base) {
-          accMap.set(a.id, { ...a, updatedAt: a.updatedAt || Date.now() })
-        } else {
-          const baseTime = getTimestampMs(base.updatedAt)
-          const inTime = getTimestampMs(a.updatedAt)
-          const isExplicitTarget = Boolean(account && account.id === a.id)
-          if (isExplicitTarget || inTime >= baseTime) {
-            accMap.set(a.id, { ...base, ...a, updatedAt: Math.max(baseTime, inTime) || a.updatedAt || base.updatedAt })
-          } else if (!already) {
-            accMap.set(a.id, base)
-          }
-        }
-      }
-      // Giữ lại các tài khoản khác đang tồn tại trên server (chưa bị xóa)
-      for (const [id, existingAcc] of existingById.entries()) {
-        if (!accMap.has(id)) {
-          accMap.set(id, existingAcc)
-        }
-      }
-      const cleanAccounts = dedupeAccounts(Array.from(accMap.values()))
+      const cleanAccounts = mergeIssuedAccountsList({
+        existingAccounts: existingAccs,
+        incomingAccounts: incomingAccountsList,
+        deletedSet: activeDelAccSet,
+        explicitTargetId: account?.id,
+      })
       cachedAccounts = cleanAccounts
       await saveSetting(
         'issac_issued_accounts_cloud',

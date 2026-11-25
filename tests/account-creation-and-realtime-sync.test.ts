@@ -2,9 +2,15 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { hasGenuineServiceRoleKey, hasSupabaseConfig } from '@/lib/supabase/admin'
 import { isUserCoreTeam, canUserManageAccounts } from '@/lib/auth/permissions'
 import { mergeEvents, mergeProposals, type MeetingEvent, type ProposalItem } from '@/lib/context/ClubContext'
-import { INITIAL_ISSUED_ACCOUNTS } from '@/lib/auth/accountData'
+import { INITIAL_ISSUED_ACCOUNTS, type IssuedAccount } from '@/lib/auth/accountData'
 import { INITIAL_MEMBERS } from '@/lib/clubData'
 import type { AuthUser } from '@/lib/auth/AuthContext'
+import {
+  dedupeAccounts,
+  mergeIssuedAccountsList,
+  findIssuedAccountForLogin,
+  isAccountDeletedBySet,
+} from '@/lib/auth/accountSync'
 
 describe('Account Persistence, Role Logic & Multi-Device Sync Fixes', () => {
   const originalUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
@@ -205,5 +211,110 @@ describe('Account Persistence, Role Logic & Multi-Device Sync Fixes', () => {
     expect(staffMember).toBeDefined()
     expect(staffMember?.full_name).toBe('Nguyễn Thị Hồng Hân')
     expect(staffMember?.email).not.toBe(masterAcc?.email)
+  })
+
+  it('6. mergeIssuedAccountsList preserves newly created accounts across concurrent syncs and dedupes duplicates', () => {
+    const serverSnapshot: IssuedAccount[] = [
+      ...INITIAL_ISSUED_ACCOUNTS,
+      {
+        id: 'acc-server-only',
+        fullName: 'Thành Viên Server',
+        email: 'server-only@vnu.edu.vn',
+        studentId: '26071111',
+        departmentCode: 'B02',
+        departmentName: 'Ban Tư vấn',
+        departmentSlug: 'tu-van',
+        role: 'member',
+        roleTitle: 'Thành viên - Ban Tư vấn',
+        passwordPlain: 'ServerPass@2026',
+        status: 'active',
+        createdAt: '25/11/2026',
+        updatedAt: 1000,
+      },
+    ]
+
+    const newLocalAcc: IssuedAccount = {
+      id: 'acc-local-new',
+      fullName: 'Thành Viên Mới',
+      email: 'LOCAL-NEW@vnu.edu.vn',
+      studentId: '26072222',
+      departmentCode: 'B01',
+      departmentName: 'Ban Truyền thông',
+      departmentSlug: 'truyen-thong',
+      role: 'dept_head',
+      roleTitle: 'Phó Ban Truyền thông',
+      passwordPlain: 'LocalPass@2026',
+      status: 'active',
+      createdAt: '25/11/2026',
+      updatedAt: 2000,
+    }
+
+    const merged = mergeIssuedAccountsList({
+      existingAccounts: serverSnapshot,
+      incomingAccounts: [newLocalAcc],
+      deletedSet: new Set(['acc-thang', '24310088']),
+      explicitTargetId: newLocalAcc.id,
+    })
+
+    expect(merged.some((a) => a.id === 'acc-local-new')).toBe(true)
+    expect(merged.some((a) => a.id === 'acc-server-only')).toBe(true)
+    expect(merged[0].id).toBe('acc-local-new')
+
+    // Dedupe removes duplicate emails and duplicate non-STAFF-001 studentIds
+    const deduped = dedupeAccounts([
+      newLocalAcc,
+      { ...newLocalAcc, id: 'acc-dup-email', email: 'local-new@vnu.edu.vn', studentId: '26079999' },
+      { ...newLocalAcc, id: 'acc-dup-mssv', email: 'other@vnu.edu.vn', studentId: '26072222' },
+    ])
+    expect(deduped).toHaveLength(1)
+  })
+
+  it('7. findIssuedAccountForLogin finds newly issued accounts by email or studentId and skips master STAFF-001 collision', () => {
+    const createdAcc: IssuedAccount = {
+      id: 'acc-created-user',
+      fullName: 'Người Dùng Mới',
+      email: 'nguoidungmoi@vnu.edu.vn',
+      studentId: '26073333',
+      departmentCode: 'B03',
+      departmentName: 'Ban Nhân sự',
+      departmentSlug: 'nhan-su',
+      role: 'hr',
+      roleTitle: 'Cán bộ Ban Nhân sự (HR)',
+      passwordPlain: 'MoiPass@2026',
+      status: 'active',
+      createdAt: '25/11/2026',
+      updatedAt: 3000,
+    }
+
+    const activeIssued = [createdAcc, ...INITIAL_ISSUED_ACCOUNTS].filter(
+      (a) => !isAccountDeletedBySet(a, new Set())
+    )
+
+    const byEmail = findIssuedAccountForLogin({
+      activeIssued,
+      cleanInput: 'nguoidungmoi@vnu.edu.vn',
+    })
+    expect(byEmail?.id).toBe('acc-created-user')
+
+    const byStudent = findIssuedAccountForLogin({
+      activeIssued,
+      cleanInput: '26073333',
+    })
+    expect(byStudent?.id).toBe('acc-created-user')
+
+    // STAFF-001 member lookup must NOT bind to acc-master
+    const staffMember = INITIAL_MEMBERS.find((m) => m.member_code === 'STAFF-001')
+    const forStaffMember = findIssuedAccountForLogin({
+      activeIssued,
+      cleanInput: 'staff-001',
+      member: staffMember,
+    })
+    expect(forStaffMember?.id).not.toBe('acc-master')
+  })
+
+  it('8. handles quoted SUPABASE_SERVICE_ROLE_KEY values cleanly', () => {
+    process.env.NEXT_PUBLIC_SUPABASE_URL = '"https://example.supabase.co"'
+    process.env.SUPABASE_SERVICE_ROLE_KEY = '"sb_secret_quoted_key_value_123456"'
+    expect(hasGenuineServiceRoleKey()).toBe(true)
   })
 })

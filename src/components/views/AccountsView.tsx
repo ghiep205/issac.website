@@ -325,21 +325,27 @@ export function AccountsView() {
       const cloudOk = res.syncPromise ? await res.syncPromise : false
       setIsCreatingAccount(false)
       setSearchQuery('')
-      setAddFeedback({
-        type: 'success',
-        message: cloudOk
-          ? `${res.message} Đã đồng bộ lên Cloud để đăng nhập ngay trên mọi thiết bị.`
-          : `${res.message} (Đã lưu trên máy này; hệ thống sẽ tự đẩy lại lên Cloud khi kết nối Supabase ổn định).`,
-      })
-      scrollAddModalToTop()
-      setTimeout(() => {
-        setIsAddModalOpen(false)
-        setAddFeedback(null)
-        setSelectedMemberCode('')
-        setNewFullName('')
-        setNewEmail('')
-        setNewStudentId('')
-      }, cloudOk ? 850 : 1600)
+      if (cloudOk) {
+        setAddFeedback({
+          type: 'success',
+          message: `${res.message} Đã đồng bộ lên Cloud để đăng nhập ngay trên mọi thiết bị.`,
+        })
+        scrollAddModalToTop()
+        setTimeout(() => {
+          setIsAddModalOpen(false)
+          setAddFeedback(null)
+          setSelectedMemberCode('')
+          setNewFullName('')
+          setNewEmail('')
+          setNewStudentId('')
+        }, 850)
+      } else {
+        setAddFeedback({
+          type: 'error',
+          message: `${res.message} Tuy nhiên chưa ghi được lên Supabase Cloud nên thiết bị khác chưa đăng nhập được. Hãy kiểm tra SUPABASE_SERVICE_ROLE_KEY / RLS bảng settings trên Vercel rồi bấm "Đồng bộ Cloud".`,
+        })
+        scrollAddModalToTop()
+      }
     } else {
       setIsCreatingAccount(false)
       const existing = issuedAccounts.find(
@@ -388,16 +394,21 @@ export function AccountsView() {
     if (res.success) {
       const cloudOk = res.syncPromise ? await res.syncPromise : false
       setIsSavingEdit(false)
-      setEditFeedback({
-        type: 'success',
-        message: cloudOk
-          ? `${res.message} Đã đồng bộ lên Cloud.`
-          : `${res.message} (Đã lưu trên máy này; đang chờ đồng bộ Cloud).`,
-      })
-      setTimeout(() => {
-        setEditingAccount(null)
-        setEditFeedback(null)
-      }, cloudOk ? 850 : 1500)
+      if (cloudOk) {
+        setEditFeedback({
+          type: 'success',
+          message: `${res.message} Đã đồng bộ lên Cloud.`,
+        })
+        setTimeout(() => {
+          setEditingAccount(null)
+          setEditFeedback(null)
+        }, 850)
+      } else {
+        setEditFeedback({
+          type: 'error',
+          message: `${res.message} Tuy nhiên chưa ghi được lên Supabase Cloud nên thiết bị khác chưa nhận thay đổi. Kiểm tra SUPABASE_SERVICE_ROLE_KEY / RLS bảng settings rồi đồng bộ lại.`,
+        })
+      }
     } else {
       setIsSavingEdit(false)
       setEditFeedback({ type: 'error', message: res.message })
@@ -547,14 +558,26 @@ export function AccountsView() {
       </div>
 
       {cloudSyncError && (
-        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-semibold flex items-start gap-2.5 shadow-2xs">
-          <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-          <div className="space-y-0.5">
-            <p className="font-bold">
-              {language === 'vi' ? 'Cảnh báo lưu trữ Cloud Supabase:' : 'Cloud Sync Notice:'}
-            </p>
-            <p className="text-amber-800 leading-relaxed">{cloudSyncError}</p>
+        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-semibold flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <p className="font-bold">
+                {language === 'vi' ? 'Cảnh báo lưu trữ Cloud Supabase:' : 'Cloud Sync Notice:'}
+              </p>
+              <p className="text-amber-800 leading-relaxed">{cloudSyncError}</p>
+            </div>
           </div>
+          <button
+            type="button"
+            onClick={handleManualSync}
+            disabled={isSyncingCloud}
+            className="px-3 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-[11px] transition shrink-0 self-start sm:self-center cursor-pointer disabled:opacity-60"
+          >
+            {isSyncingCloud
+              ? language === 'vi' ? 'Đang thử lại...' : 'Retrying...'
+              : language === 'vi' ? 'Thử đồng bộ lại' : 'Retry Sync'}
+          </button>
         </div>
       )}
 
