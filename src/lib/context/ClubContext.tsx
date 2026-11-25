@@ -526,7 +526,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
-      const savedDeletedMemberCodes = localStorage.getItem('issac_deleted_member_codes')
+      const savedDeletedMemberCodes = localStorage.getItem('issac_deleted_member_codes_v2')
       if (savedDeletedMemberCodes) {
         const parsed = JSON.parse(savedDeletedMemberCodes)
         if (Array.isArray(parsed)) {
@@ -561,15 +561,13 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
           }
         })
 
-      // Tự động bổ sung thành viên mặc định nếu thiết bị chưa có và chưa bị xóa
-      if (!savedMembers) {
-        const existingCodes = new Set(initialMemberList.map((m) => m.member_code))
-        const missingInitial = INITIAL_MEMBERS.filter(
-          (m) => !existingCodes.has(m.member_code) && !deletedMemberCodesRef.current.has(m.member_code)
-        )
-        if (missingInitial.length > 0) {
-          initialMemberList = [...initialMemberList, ...missingInitial]
-        }
+      // Tự động bổ sung thành viên mặc định nếu chưa có trong danh sách và chưa bị xóa trong v2
+      const existingCodes = new Set(initialMemberList.map((m) => m.member_code))
+      const missingInitial = INITIAL_MEMBERS.filter(
+        (m) => !existingCodes.has(m.member_code) && !deletedMemberCodesRef.current.has(m.member_code)
+      )
+      if (missingInitial.length > 0) {
+        initialMemberList = [...initialMemberList, ...missingInitial]
       }
       let initialProposalList: ProposalItem[] = []
       if (savedProposals) {
@@ -837,7 +835,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
           })
           try {
             localStorage.setItem(
-              'issac_deleted_member_codes',
+              'issac_deleted_member_codes_v2',
               JSON.stringify(Array.from(deletedMemberCodesRef.current))
             )
           } catch (e) {}
@@ -895,14 +893,12 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
             hasLocalNewer = true
           }
 
-          // Chỉ bù thành viên mặc định nếu chưa có trong danh sách và chưa bị xóa
-          if (data.source !== 'supabase_cloud') {
-            const mergedCodes = new Set(merged.map((m: any) => m.member_code))
-            const missingCore = INITIAL_MEMBERS.filter((m) => !mergedCodes.has(m.member_code) && !deletedCodes.has(m.member_code))
-            if (missingCore.length > 0) {
-              merged.push(...missingCore)
-              hasLocalNewer = true
-            }
+          // Chỉ bù thành viên mặc định nếu chưa có trong danh sách và chưa bị xóa trong issac_deleted_member_codes_v2
+          const mergedCodes = new Set(merged.map((m: any) => m.member_code))
+          const missingCore = INITIAL_MEMBERS.filter((m) => !mergedCodes.has(m.member_code) && !deletedCodes.has(m.member_code))
+          if (missingCore.length > 0) {
+            merged.push(...missingCore)
+            hasLocalNewer = true
           }
 
           // Tự động chuẩn hóa điểm số thực tế từ sổ cái proposals cho chu kỳ đang kích hoạt
@@ -1320,7 +1316,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     // Gỡ khỏi deletedMemberCodes nếu trước đó từng bị đánh dấu xóa
     deletedMemberCodesRef.current.delete(generatedCode)
     try {
-      localStorage.setItem('issac_deleted_member_codes', JSON.stringify(Array.from(deletedMemberCodesRef.current)))
+      localStorage.setItem('issac_deleted_member_codes_v2', JSON.stringify(Array.from(deletedMemberCodesRef.current)))
     } catch (e) {}
 
     const currentList = (membersRef.current.length > 0 ? membersRef.current : members).filter(
@@ -1457,7 +1453,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
 
     deletedMemberCodesRef.current.add(memberCode)
     try {
-      localStorage.setItem('issac_deleted_member_codes', JSON.stringify(Array.from(deletedMemberCodesRef.current)))
+      localStorage.setItem('issac_deleted_member_codes_v2', JSON.stringify(Array.from(deletedMemberCodesRef.current)))
     } catch (e) {}
 
     const updated = currentList.filter((m) => m.member_code !== memberCode)

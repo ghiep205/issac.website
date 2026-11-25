@@ -417,21 +417,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   // Load saved accounts & active user from localStorage
   useEffect(() => {
-    // Nạp tombstones từ cả 2 key lưu trữ
+    // Chỉ nạp tombstones tài khoản (tách biệt hoàn toàn với danh sách xóa thành viên)
     try {
       const savedDelAccs = localStorage.getItem('issac_deleted_account_ids')
       if (savedDelAccs) {
         const parsed = JSON.parse(savedDelAccs)
-        if (Array.isArray(parsed)) {
-          parsed.forEach((id: string) => {
-            deletedAccountIdsRef.current.add(id)
-            deletedAccountIdsRef.current.add(id.toLowerCase())
-          })
-        }
-      }
-      const savedDelMembers = localStorage.getItem('issac_deleted_member_codes')
-      if (savedDelMembers) {
-        const parsed = JSON.parse(savedDelMembers)
         if (Array.isArray(parsed)) {
           parsed.forEach((id: string) => {
             deletedAccountIdsRef.current.add(id)
@@ -560,11 +550,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (
         e.key === 'issac_issued_accounts' ||
         e.key === 'issac_active_user' ||
-        e.key === 'issac_deleted_account_ids' ||
-        e.key === 'issac_deleted_member_codes'
+        e.key === 'issac_deleted_account_ids'
       ) {
         try {
-          if (e.key === 'issac_deleted_account_ids' || e.key === 'issac_deleted_member_codes') {
+          if (e.key === 'issac_deleted_account_ids') {
             if (e.newValue) {
               const parsed = JSON.parse(e.newValue)
               if (Array.isArray(parsed)) {

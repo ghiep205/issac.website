@@ -68,7 +68,7 @@ export async function GET(request: Request) {
         'issac_custom_rules_cloud',
         'issac_issued_accounts_cloud',
         'issac_deleted_account_ids',
-        'issac_deleted_member_codes',
+        'issac_deleted_member_codes_v2',
         'issac_activities_cloud',
         'issac_schedule_pending_requests',
         'issac_survey_events_cloud',
@@ -92,7 +92,7 @@ export async function GET(request: Request) {
       const customRulesRow = data.find((r) => r.key === 'issac_custom_rules_cloud')
       const accountsRow = data.find((r) => r.key === 'issac_issued_accounts_cloud')
       const deletedAccountsRow = data.find((r) => r.key === 'issac_deleted_account_ids')
-      const deletedMemberCodesRow = data.find((r) => r.key === 'issac_deleted_member_codes')
+      const deletedMemberCodesRow = data.find((r) => r.key === 'issac_deleted_member_codes_v2')
       const activitiesRow = data.find((r) => r.key === 'issac_activities_cloud')
       const schedulePendingRequestsRow = data.find((r) => r.key === 'issac_schedule_pending_requests')
       const surveyEventsRow = data.find((r) => r.key === 'issac_survey_events_cloud')
@@ -360,12 +360,12 @@ export async function GET(request: Request) {
         finalMembers = finalMembers.filter(
           (m: any) => m?.member_code && !activeDeletedMemberCodes.has(m.member_code)
         )
-        // Chỉ bổ sung thành viên mặc định nếu chưa bị xóa và chưa có trong danh sách
+        // Chỉ bổ sung thành viên mặc định nếu chưa bị xóa trong issac_deleted_member_codes_v2 và chưa có trong danh sách
         const existingCodes = new Set(finalMembers.map((m: any) => m.member_code))
         const missingInitial = INITIAL_MEMBERS.filter(
           (m) => !existingCodes.has(m.member_code) && !activeDeletedMemberCodes.has(m.member_code)
         )
-        if (missingInitial.length > 0 && !membersFromDb) {
+        if (missingInitial.length > 0) {
           finalMembers = [...finalMembers, ...missingInitial]
         }
         finalMembers = finalMembers.map((m: any) => ({
@@ -745,10 +745,10 @@ export async function POST(request: Request) {
       )
     }
 
-    // 0.4 Quản lý danh sách Member Code đã xóa (Tombstones để chống hồi sinh khi sync từ thiết bị khác)
+    // 0.4 Quản lý danh sách Member Code đã xóa (Tombstones tách biệt hoàn toàn với tài khoản)
     if (deletedMemberCodes !== undefined || (action === 'delete_member' && memberCode) || (action === 'add_member' && member?.member_code)) {
       if (cachedDeletedMemberCodes === null) {
-        cachedDeletedMemberCodes = await loadSettingJson<string[]>(supabase, 'issac_deleted_member_codes')
+        cachedDeletedMemberCodes = await loadSettingJson<string[]>(supabase, 'issac_deleted_member_codes_v2')
       }
       const incomingDel = Array.isArray(deletedMemberCodes) ? [...deletedMemberCodes] : []
       if (action === 'delete_member' && memberCode && !incomingDel.includes(memberCode)) {
@@ -764,9 +764,9 @@ export async function POST(request: Request) {
       cachedDeletedMemberCodes = Array.from(combinedDelSet)
 
       await saveSetting(
-        'issac_deleted_member_codes',
+        'issac_deleted_member_codes_v2',
         JSON.stringify(cachedDeletedMemberCodes),
-        'Cloud synchronized deleted member codes for iSSAC Web'
+        'Cloud synchronized deleted member codes (v2) for iSSAC Web'
       )
     }
 
@@ -1004,7 +1004,7 @@ export async function POST(request: Request) {
         cachedMembers = await loadSettingJson<any[]>(supabase, 'issac_members_cloud')
       }
       if (cachedDeletedMemberCodes === null) {
-        cachedDeletedMemberCodes = await loadSettingJson<string[]>(supabase, 'issac_deleted_member_codes')
+        cachedDeletedMemberCodes = await loadSettingJson<string[]>(supabase, 'issac_deleted_member_codes_v2')
       }
       const activeDelMemSet = new Set(cachedDeletedMemberCodes || [])
       let baseMembers = members !== undefined ? members : (cachedMembers || INITIAL_MEMBERS)
@@ -1024,12 +1024,21 @@ export async function POST(request: Request) {
       }
 
       // Giữ cả thành viên mới thêm, chỉ loại bỏ các thành viên đã xóa và cắt avatar quá lớn
-      const cleanMembers = baseMembers
+      let cleanMembers = baseMembers
         .filter((m: any) => m?.member_code && !activeDelMemSet.has(m.member_code))
         .map((m: any) => ({
           ...m,
           avatar_url: m.avatar_url && m.avatar_url.length > 40000 ? undefined : m.avatar_url,
         }))
+
+      // Khôi phục các thành viên mặc định nếu chưa bị xóa trong issac_deleted_member_codes_v2
+      const existingCleanCodes = new Set(cleanMembers.map((m: any) => m.member_code))
+      const missingInitial = INITIAL_MEMBERS.filter(
+        (m) => !existingCleanCodes.has(m.member_code) && !activeDelMemSet.has(m.member_code)
+      )
+      if (missingInitial.length > 0) {
+        cleanMembers = [...cleanMembers, ...missingInitial]
+      }
 
       cachedMembers = cleanMembers
       await saveSetting(
