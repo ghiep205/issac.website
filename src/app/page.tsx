@@ -39,6 +39,12 @@ export default function AppHome() {
   useEffect(() => {
     if (isAuthChecked && !currentUser) {
       router.replace('/login')
+      const fallbackTimer = setTimeout(() => {
+        if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+          window.location.replace('/login')
+        }
+      }, 600)
+      return () => clearTimeout(fallbackTimer)
     }
   }, [isAuthChecked, currentUser, router])
 

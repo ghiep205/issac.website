@@ -255,6 +255,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [issuedAccounts, setIssuedAccounts] = useState<IssuedAccount[]>(() => {
     return INITIAL_ISSUED_ACCOUNTS.filter((a) => !DEFAULT_DELETED_ACCOUNT_IDS.includes(a.id))
   })
+  const issuedAccountsRef = useRef<IssuedAccount[]>(issuedAccounts)
+  useEffect(() => {
+    issuedAccountsRef.current = issuedAccounts
+  }, [issuedAccounts])
   const deletedAccountIdsRef = useRef<Set<string>>(new Set(DEFAULT_DELETED_ACCOUNT_IDS))
 
   // Kiểm tra một chuỗi bất kỳ có nằm trong danh sách đã bị xóa không
@@ -339,7 +343,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             if (!rawId) continue
             deletedAccountIdsRef.current.add(rawId)
             deletedAccountIdsRef.current.add(rawId.toLowerCase())
-            const aliases = resolveAllAssociatedIdentities(rawId, issuedAccounts)
+            const aliases = resolveAllAssociatedIdentities(rawId, issuedAccountsRef.current)
             for (const a of aliases) {
               deletedAccountIdsRef.current.add(a)
               deletedAccountIdsRef.current.add(a.toLowerCase())
@@ -365,6 +369,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               }
             }
             const cleanList = Array.from(localMap.values()).filter((a) => !isEntityDeleted(a))
+            if (JSON.stringify(cleanList) === JSON.stringify(prev)) {
+              return prev
+            }
             try {
               localStorage.setItem('issac_issued_accounts', JSON.stringify(cleanList))
             } catch (e) {}
@@ -373,6 +380,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         } else {
           setIssuedAccounts((prev) => {
             const clean = prev.filter((a) => !isEntityDeleted(a))
+            if (clean.length === prev.length) {
+              return prev
+            }
             try {
               localStorage.setItem('issac_issued_accounts', JSON.stringify(clean))
             } catch (e) {}
@@ -402,7 +412,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       // Offline fallback
     }
-  }, [isEntityDeleted, issuedAccounts])
+  }, [isEntityDeleted])
 
   // Load saved accounts & active user from localStorage
   useEffect(() => {
