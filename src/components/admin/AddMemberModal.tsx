@@ -24,6 +24,7 @@ export function AddMemberModal({ isOpen, onClose }: AddMemberModalProps) {
   const [isCore, setIsCore] = useState(false)
   const [avatarUrl, setAvatarUrl] = useState('')
   const [successMsg, setSuccessMsg] = useState('')
+  const [errorMsg, setErrorMsg] = useState('')
 
   if (!isOpen) return null
 
@@ -36,9 +37,13 @@ export function AddMemberModal({ isOpen, onClose }: AddMemberModalProps) {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!fullName.trim() || !email.trim()) return
+    setErrorMsg('')
+    if (!fullName.trim() || !email.trim()) {
+      setErrorMsg('Vui lòng nhập đầy đủ Họ tên và Email liên hệ.')
+      return
+    }
 
-    addMember({
+    const res = addMember({
       fullName,
       departmentCode,
       position,
@@ -50,7 +55,12 @@ export function AddMemberModal({ isOpen, onClose }: AddMemberModalProps) {
       avatarUrl: avatarUrl.trim() || undefined,
     })
 
-    setSuccessMsg(`Đã thêm thành công thành viên: ${fullName.trim()} (Điểm khởi đầu: 60)`)
+    if (!res.success) {
+      setErrorMsg(res.message)
+      return
+    }
+
+    setSuccessMsg(res.message || `Đã thêm thành công thành viên: ${fullName.trim()} (Điểm khởi đầu: 60)`)
     setTimeout(() => {
       setSuccessMsg('')
       onClose()
@@ -62,7 +72,7 @@ export function AddMemberModal({ isOpen, onClose }: AddMemberModalProps) {
       setEmail('')
       setIsCore(false)
       setAvatarUrl('')
-    }, 1500)
+    }, 1300)
   }
 
   return (
@@ -104,6 +114,12 @@ export function AddMemberModal({ isOpen, onClose }: AddMemberModalProps) {
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="space-y-4 text-xs">
+            {errorMsg && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-semibold flex items-start gap-2">
+                <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
             {/* Ảnh đại diện (Avatar) */}
             <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200/90 flex items-center gap-4">
               <div className="relative shrink-0">

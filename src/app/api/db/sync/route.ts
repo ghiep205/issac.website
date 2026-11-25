@@ -1,9 +1,15 @@
 import { NextResponse } from 'next/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { createAdminClient, hasSupabaseConfig } from '@/lib/supabase/admin'
 import { AVAILABLE_PERIODS } from '@/lib/periodData'
 import { INITIAL_MEMBERS } from '@/lib/clubData'
 import { INITIAL_ISSUED_ACCOUNTS } from '@/lib/auth/accountData'
 import { INITIAL_ACTIVITIES } from '@/lib/scheduleData'
+
+const NO_STORE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+  Pragma: 'no-cache',
+  Expires: '0',
+} as const
 
 // Bộ nhớ đệm tạm thời phía server để phản hồi tức thì
 let cachedEvents: any[] | null = null
@@ -45,6 +51,93 @@ function isAccountDeletedBySet(acc: any, delSet: Set<string>): boolean {
     return true
   }
   return false
+}
+
+function normalizeAccountIdentity(value?: string | null): string {
+  return String(value || '').toLowerCase().trim()
+}
+
+function dedupeAccounts(list: any[]): any[] {
+  const seenIds = new Set<string>()
+  const seenEmails = new Set<string>()
+  const seenStudentIds = new Set<string>()
+  const result: any[] = []
+
+  for (const acc of list) {
+    if (!acc || typeof acc !== 'object') continue
+    const id = String(acc.id || '').trim()
+    if (!id || seenIds.has(id)) continue
+
+    const emailKey = normalizeAccountIdentity(acc.email)
+    if (emailKey && seenEmails.has(emailKey)) continue
+
+    const studentKey = normalizeAccountIdentity(acc.studentId)
+    if (studentKey && studentKey !== 'staff-001' && seenStudentIds.has(studentKey)) continue
+
+    seenIds.add(id)
+    if (emailKey) seenEmails.add(emailKey)
+    if (studentKey && studentKey !== 'staff-001') seenStudentIds.add(studentKey)
+    result.push(acc)
+  }
+
+  return result
+}
+
+function getTimestampMs(val: unknown): number {
+  if (typeof val === 'number' && Number.isFinite(val)) return val
+  if (typeof val === 'string' && val.trim()) {
+    const num = Number(val)
+    if (Number.isFinite(num) && num > 1000000000) return num
+    const parsed = Date.parse(val)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return 0
+}
+
+function getProposalStatusWeight(status?: string): number {
+  if (status === 'approved' || status === 'rejected') return 2
+  if (status === 'pending_bcn' || status === 'pending') return 1
+  return 0
+}
+
+function getDisputeStatusWeight(status?: string): number {
+  if (status === 'approved_resolved' || status === 'resolved' || status === 'rejected') return 3
+  if (status === 'pending_bcn' || status === 'hr_reviewed') return 2
+  if (status === 'pending_hr_review' || status === 'pending') return 1
+  return 0
+}
+
+const RAW_TEXT_SETTING_KEYS = new Set(['issac_active_period_id', 'issac_active_event_id'])
+
+async function loadSettingsBatch(
+  supabase: ReturnType<typeof createAdminClient>,
+  keys: string[]
+): Promise<Record<string, any> | null> {
+  if (!hasSupabaseConfig() || keys.length === 0) return null
+  try {
+    const { data, error } = await supabase
+      .from('settings')
+      .select('key, value')
+      .in('key', keys)
+    if (error || !Array.isArray(data)) return null
+    const parsed: Record<string, any> = {}
+    for (const row of data) {
+      if (!row?.key || row.value === undefined) continue
+      if (RAW_TEXT_SETTING_KEYS.has(row.key)) {
+        parsed[row.key] = row.value
+      } else if (row.value) {
+        try {
+          parsed[row.key] = JSON.parse(row.value)
+        } catch (e) {
+          console.warn(`Supabase loadSettingsBatch parse(${row.key}) notice:`, e)
+        }
+      }
+    }
+    return parsed
+  } catch (e) {
+    console.warn('Supabase loadSettingsBatch notice:', e)
+    return null
+  }
 }
 
 async function loadSettingJson<T>(supabase: ReturnType<typeof createAdminClient>, key: string): Promise<T | null> {
@@ -98,7 +191,7 @@ export async function GET(request: Request) {
         'issac_bcn_survey_notes_cloud',
       ])
 
-    if (!error && data && data.length > 0) {
+    if (!error && Array.isArray(data)) {
       const eventsRow = data.find((r) => r.key === 'issac_events_cloud')
       const proposalsRow = data.find((r) => r.key === 'issac_proposals_cloud')
       const membersRow = data.find((r) => r.key === 'issac_members_cloud')
@@ -386,10 +479,16 @@ export async function GET(request: Request) {
       const activeDeletedMemberCodes = new Set<string>((deletedMemberCodesFromDb || cachedDeletedMemberCodes || []) as string[])
       const activeDeletedActivityIds = new Set<string>((deletedActivityIdsFromDb || cachedDeletedActivityIds || []) as string[])
 
-      let finalAccounts = accountsFromDb || cachedAccounts || INITIAL_ISSUED_ACCOUNTS
+      let finalAccounts =
+        accountsFromDb !== null
+          ? accountsFromDb
+          : cachedAccounts !== null
+            ? cachedAccounts
+            : INITIAL_ISSUED_ACCOUNTS
       if (Array.isArray(finalAccounts) && activeDeletedAccountIds.size > 0) {
         finalAccounts = finalAccounts.filter((a: any) => !isAccountDeletedBySet(a, activeDeletedAccountIds))
       }
+      finalAccounts = dedupeAccounts(Array.isArray(finalAccounts) ? finalAccounts : [])
       cachedAccounts = finalAccounts
 
       let finalActivities = activitiesFromDb !== null ? activitiesFromDb : cachedActivities
@@ -458,13 +557,7 @@ export async function GET(request: Request) {
           bcnSurveyNotes: bcnSurveyNotesFromDb || cachedBcnSurveyNotes || {},
           source: 'supabase_cloud',
         },
-        {
-          headers: {
-            'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
-            Pragma: 'no-cache',
-            Expires: '0',
-          },
-        }
+        { headers: NO_STORE_HEADERS }
       )
     }
 
@@ -498,10 +591,12 @@ export async function GET(request: Request) {
     const safeFallbackPeriods = Array.from(fallbackPeriodMap.values())
 
     const fallbackDeletedAccountIds = new Set(cachedDeletedAccountIds || [])
-    let fallbackAccounts = (cachedAccounts && cachedAccounts.length > 0) ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
+    let fallbackAccounts =
+      cachedAccounts !== null ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
     if (fallbackDeletedAccountIds.size > 0 && Array.isArray(fallbackAccounts)) {
       fallbackAccounts = fallbackAccounts.filter((a: any) => !isAccountDeletedBySet(a, fallbackDeletedAccountIds))
     }
+    fallbackAccounts = dedupeAccounts(Array.isArray(fallbackAccounts) ? fallbackAccounts : [])
 
     const fallbackDelMemberSet = new Set(cachedDeletedMemberCodes || [])
     let fallbackMembers = cachedMembers || INITIAL_MEMBERS
@@ -552,13 +647,7 @@ export async function GET(request: Request) {
         bcnSurveyNotes: cachedBcnSurveyNotes || {},
         source: 'cache_memory',
       },
-      {
-        headers: {
-          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
-          Pragma: 'no-cache',
-          Expires: '0',
-        },
-      }
+      { headers: NO_STORE_HEADERS }
     )
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Sync error'
@@ -583,37 +672,42 @@ export async function GET(request: Request) {
       }
     }
 
-    let errorFallbackAccounts = (cachedAccounts && cachedAccounts.length > 0) ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
+    let errorFallbackAccounts =
+      cachedAccounts !== null ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
     const errorDelAccSet = new Set(cachedDeletedAccountIds || [])
     if (errorDelAccSet.size > 0 && Array.isArray(errorFallbackAccounts)) {
       errorFallbackAccounts = errorFallbackAccounts.filter((a: any) => !isAccountDeletedBySet(a, errorDelAccSet))
     }
+    errorFallbackAccounts = dedupeAccounts(Array.isArray(errorFallbackAccounts) ? errorFallbackAccounts : [])
 
-    return NextResponse.json({
-      success: true,
-      events: errorFallbackEvents,
-      proposals: cachedProposals,
-      members: errorFallbackMembers,
-      disputes: cachedDisputes,
-      periods: cachedPeriods || AVAILABLE_PERIODS,
-      activePeriodId: cachedActivePeriodId || 'month-2026-11',
-      customPeriodScores: cachedPeriodScores,
-      deletedProposalIds: cachedDeletedProposalIds || [],
-      deletedEventIds: cachedDeletedEventIds || [],
-      deletedPeriodIds: cachedDeletedPeriodIds || [],
-      deletedMemberCodes: Array.from(errorDelMemberSet),
-      accounts: errorFallbackAccounts,
-      deletedAccountIds: Array.from(errorDelAccSet),
-      activities: cachedActivities !== null ? cachedActivities : INITIAL_ACTIVITIES,
-      deletedActivityIds: cachedDeletedActivityIds || [],
-      surveyEvents: cachedSurveyEvents,
-      surveyFeedbacks: cachedSurveyFeedbacks || [],
-      deletedSurveyEventIds: cachedDeletedSurveyEventIds || [],
-      surveyCustomQuestions: cachedSurveyCustomQuestions || {},
-      bcnSurveyNotes: cachedBcnSurveyNotes || {},
-      error: msg,
-      source: 'fallback',
-    })
+    return NextResponse.json(
+      {
+        success: true,
+        events: errorFallbackEvents,
+        proposals: cachedProposals,
+        members: errorFallbackMembers,
+        disputes: cachedDisputes,
+        periods: cachedPeriods || AVAILABLE_PERIODS,
+        activePeriodId: cachedActivePeriodId || 'month-2026-11',
+        customPeriodScores: cachedPeriodScores,
+        deletedProposalIds: cachedDeletedProposalIds || [],
+        deletedEventIds: cachedDeletedEventIds || [],
+        deletedPeriodIds: cachedDeletedPeriodIds || [],
+        deletedMemberCodes: Array.from(errorDelMemberSet),
+        accounts: errorFallbackAccounts,
+        deletedAccountIds: Array.from(errorDelAccSet),
+        activities: cachedActivities !== null ? cachedActivities : INITIAL_ACTIVITIES,
+        deletedActivityIds: cachedDeletedActivityIds || [],
+        surveyEvents: cachedSurveyEvents,
+        surveyFeedbacks: cachedSurveyFeedbacks || [],
+        deletedSurveyEventIds: cachedDeletedSurveyEventIds || [],
+        surveyCustomQuestions: cachedSurveyCustomQuestions || {},
+        bcnSurveyNotes: cachedBcnSurveyNotes || {},
+        error: msg,
+        source: 'fallback',
+      },
+      { headers: NO_STORE_HEADERS }
+    )
   }
 }
 
@@ -630,6 +724,7 @@ export async function POST(request: Request) {
       status,
       note,
       proposals,
+      proposal,
       proposalId,
       deletedProposalIds,
       deletedEventIds,
@@ -643,6 +738,7 @@ export async function POST(request: Request) {
       customPeriodScores,
       customRules,
       accounts,
+      account,
       deletedAccountIds,
       accountId,
       unblockAccountIdentities,
@@ -662,10 +758,98 @@ export async function POST(request: Request) {
     } = body
     const supabase = createAdminClient()
 
-    let dbSuccess = false
+    // Hydrate latest Supabase rows for keys touched by this request so multi-instance serverless RAM never overwrites newer data
+    const neededKeysSet = new Set<string>()
+    if (deletedProposalIds !== undefined || action === 'delete_proposal') neededKeysSet.add('issac_deleted_proposal_ids')
+    if (deletedEventIds !== undefined || action === 'delete_event') neededKeysSet.add('issac_deleted_event_ids')
+    if (deletedPeriodIds !== undefined || action === 'delete_period' || periods !== undefined) {
+      neededKeysSet.add('issac_deleted_period_ids')
+    }
+    if (
+      deletedAccountIds !== undefined ||
+      action === 'delete_account' ||
+      action === 'create_account' ||
+      action === 'update_account' ||
+      accounts !== undefined ||
+      account !== undefined ||
+      (Array.isArray(unblockAccountIdentities) && unblockAccountIdentities.length > 0)
+    ) {
+      neededKeysSet.add('issac_deleted_account_ids')
+      neededKeysSet.add('issac_issued_accounts_cloud')
+    }
+    if (deletedMemberCodes !== undefined || action === 'delete_member' || action === 'add_member' || members !== undefined) {
+      neededKeysSet.add('issac_deleted_member_codes_v2')
+      neededKeysSet.add('issac_members_cloud')
+    }
+    if (
+      events !== undefined ||
+      event !== undefined ||
+      ['delete_event', 'create_event', 'update_event', 'update_event_attendees', 'register', 'unregister', 'checkin', 'finalize'].includes(
+        String(action || '')
+      )
+    ) {
+      neededKeysSet.add('issac_events_cloud')
+      neededKeysSet.add('issac_deleted_event_ids')
+    }
+    if (
+      proposals !== undefined ||
+      proposal !== undefined ||
+      ['create_proposal', 'update_proposal', 'approve_proposal', 'reject_proposal', 'delete_proposal'].includes(String(action || ''))
+    ) {
+      neededKeysSet.add('issac_proposals_cloud')
+      neededKeysSet.add('issac_deleted_proposal_ids')
+    }
+    if (disputes !== undefined || action === 'create_dispute' || action === 'review_dispute' || action === 'resolve_dispute') {
+      neededKeysSet.add('issac_disputes_cloud')
+    }
+    if (periods !== undefined || action === 'delete_period') {
+      neededKeysSet.add('issac_periods_cloud')
+    }
+    if (customPeriodScores !== undefined || action === 'delete_period' || action === 'reset_period_scores') {
+      neededKeysSet.add('issac_custom_period_scores')
+    }
+    if (deletedActivityIds !== undefined || action === 'delete_activity' || activities !== undefined) {
+      neededKeysSet.add('issac_deleted_activity_ids')
+      neededKeysSet.add('issac_activities_cloud')
+    }
+    if (deletedSurveyEventIds !== undefined || action === 'delete_survey_event' || surveyEvents !== undefined || surveyFeedbacks !== undefined) {
+      neededKeysSet.add('issac_deleted_survey_event_ids')
+      neededKeysSet.add('issac_survey_events_cloud')
+      neededKeysSet.add('issac_survey_feedbacks_cloud')
+    }
+    if (surveyCustomQuestions !== undefined) neededKeysSet.add('issac_survey_custom_questions_cloud')
+    if (bcnSurveyNotes !== undefined) neededKeysSet.add('issac_bcn_survey_notes_cloud')
+
+    const freshBatch = await loadSettingsBatch(supabase, Array.from(neededKeysSet))
+    if (freshBatch) {
+      if ('issac_events_cloud' in freshBatch) cachedEvents = freshBatch.issac_events_cloud
+      if ('issac_proposals_cloud' in freshBatch) cachedProposals = freshBatch.issac_proposals_cloud
+      if ('issac_members_cloud' in freshBatch) cachedMembers = freshBatch.issac_members_cloud
+      if ('issac_disputes_cloud' in freshBatch) cachedDisputes = freshBatch.issac_disputes_cloud
+      if ('issac_periods_cloud' in freshBatch) cachedPeriods = freshBatch.issac_periods_cloud
+      if ('issac_custom_period_scores' in freshBatch) cachedPeriodScores = freshBatch.issac_custom_period_scores
+      if ('issac_deleted_proposal_ids' in freshBatch) cachedDeletedProposalIds = freshBatch.issac_deleted_proposal_ids
+      if ('issac_deleted_event_ids' in freshBatch) cachedDeletedEventIds = freshBatch.issac_deleted_event_ids
+      if ('issac_deleted_period_ids' in freshBatch) cachedDeletedPeriodIds = freshBatch.issac_deleted_period_ids
+      if ('issac_issued_accounts_cloud' in freshBatch) cachedAccounts = freshBatch.issac_issued_accounts_cloud
+      if ('issac_deleted_account_ids' in freshBatch) cachedDeletedAccountIds = freshBatch.issac_deleted_account_ids
+      if ('issac_deleted_member_codes_v2' in freshBatch) cachedDeletedMemberCodes = freshBatch.issac_deleted_member_codes_v2
+      if ('issac_activities_cloud' in freshBatch) cachedActivities = freshBatch.issac_activities_cloud
+      if ('issac_deleted_activity_ids' in freshBatch) cachedDeletedActivityIds = freshBatch.issac_deleted_activity_ids
+      if ('issac_survey_events_cloud' in freshBatch) cachedSurveyEvents = freshBatch.issac_survey_events_cloud
+      if ('issac_survey_feedbacks_cloud' in freshBatch) cachedSurveyFeedbacks = freshBatch.issac_survey_feedbacks_cloud
+      if ('issac_deleted_survey_event_ids' in freshBatch) cachedDeletedSurveyEventIds = freshBatch.issac_deleted_survey_event_ids
+      if ('issac_survey_custom_questions_cloud' in freshBatch) cachedSurveyCustomQuestions = freshBatch.issac_survey_custom_questions_cloud
+      if ('issac_bcn_survey_notes_cloud' in freshBatch) cachedBcnSurveyNotes = freshBatch.issac_bcn_survey_notes_cloud
+    }
+
+    let attemptedSaves = 0
+    let succeededSaves = 0
+    const failedKeys: string[] = []
     let dbErrorMsg: string | null = null
 
     const saveSetting = async (key: string, rawValue: string, description: string) => {
+      attemptedSaves += 1
       try {
         const { error: upsertErr } = await supabase
           .from('settings')
@@ -680,12 +864,14 @@ export async function POST(request: Request) {
           )
         if (upsertErr) {
           dbErrorMsg = upsertErr.message
+          failedKeys.push(key)
           console.warn(`Supabase ${key} upsert notice:`, upsertErr.message)
         } else {
-          dbSuccess = true
+          succeededSaves += 1
         }
       } catch (err: any) {
         dbErrorMsg = err?.message || 'Database error'
+        failedKeys.push(key)
         console.warn(`Supabase ${key} catch notice:`, err)
       }
     }
@@ -768,30 +954,32 @@ export async function POST(request: Request) {
     }
 
     // 0.3 Quản lý danh sách ID tài khoản đã xóa (Tombstones để đồng bộ nhất quán giữa Điện thoại và Máy tính)
+    const isCreateOrUpdateAccount = action === 'create_account' || action === 'update_account'
+    const targetAccountObj = account && typeof account === 'object' ? account : null
     const hasUnblockIdentities = Array.isArray(unblockAccountIdentities) && unblockAccountIdentities.length > 0
-    if (deletedAccountIds !== undefined || (action === 'delete_account' && accountId) || hasUnblockIdentities) {
+    if (
+      deletedAccountIds !== undefined ||
+      (action === 'delete_account' && accountId) ||
+      hasUnblockIdentities ||
+      (isCreateOrUpdateAccount && (targetAccountObj || (Array.isArray(accounts) && accounts.length > 0)))
+    ) {
       if (cachedDeletedAccountIds === null) {
         cachedDeletedAccountIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_account_ids')
       }
       if (cachedAccounts === null) {
         cachedAccounts = await loadSettingJson<any[]>(supabase, 'issac_issued_accounts_cloud')
       }
-      const incomingDelAcc = Array.isArray(deletedAccountIds) ? [...deletedAccountIds] : []
-      if (action === 'delete_account' && accountId && !incomingDelAcc.includes(accountId)) {
-        incomingDelAcc.push(accountId)
-      }
-      if (body.studentId && !incomingDelAcc.includes(body.studentId)) {
-        incomingDelAcc.push(body.studentId)
-      }
-      if (body.memberCode && !incomingDelAcc.includes(body.memberCode)) {
-        incomingDelAcc.push(body.memberCode)
-      }
-      if (body.email && !incomingDelAcc.includes(body.email)) {
-        incomingDelAcc.push(body.email)
+      // Tránh re-poison tombstone từ client snapshot cũ khi đang tạo/cập nhật tài khoản
+      const incomingDelAcc = !isCreateOrUpdateAccount && Array.isArray(deletedAccountIds) ? [...deletedAccountIds] : []
+      if (action === 'delete_account') {
+        if (accountId && !incomingDelAcc.includes(accountId)) incomingDelAcc.push(accountId)
+        if (body.studentId && !incomingDelAcc.includes(body.studentId)) incomingDelAcc.push(body.studentId)
+        if (body.memberCode && !incomingDelAcc.includes(body.memberCode)) incomingDelAcc.push(body.memberCode)
+        if (body.email && !incomingDelAcc.includes(body.email)) incomingDelAcc.push(body.email)
       }
 
       // Tự động mở rộng bí danh cho Trần Đức Thắng nếu có thao tác xóa
-      if (action === 'delete_account' || deletedAccountIds !== undefined) {
+      if (action === 'delete_account' || (!isCreateOrUpdateAccount && deletedAccountIds !== undefined)) {
         for (const item of [...incomingDelAcc]) {
           const clean = String(item).toLowerCase().trim()
           if (clean === 'acc-thang' || clean === '24310088' || clean === 'tdthang@vnuis.edu.vn') {
@@ -808,11 +996,21 @@ export async function POST(request: Request) {
         ...incomingDelAcc,
       ])
 
-      // Khi BCN cấp lại tài khoản mới cho một người từng có tài khoản bị xóa:
-      // gỡ studentId/email/fullName khỏi tombstone (giữ nguyên acc-... cũ đã xóa)
-      if (hasUnblockIdentities) {
+      // Khi BCN cấp lại/cập nhật tài khoản mới cho một người từng có tài khoản bị xóa:
+      // gỡ studentId/email/fullName/id khỏi tombstone (giữ nguyên acc-... cũ đã xóa khác id)
+      const autoUnblock: string[] = hasUnblockIdentities ? [...unblockAccountIdentities] : []
+      if (isCreateOrUpdateAccount && targetAccountObj) {
+        if (targetAccountObj.id) autoUnblock.push(String(targetAccountObj.id))
+        if (targetAccountObj.email) autoUnblock.push(String(targetAccountObj.email))
+        if (targetAccountObj.studentId && String(targetAccountObj.studentId).toUpperCase() !== 'STAFF-001') {
+          autoUnblock.push(String(targetAccountObj.studentId))
+        }
+        if (targetAccountObj.fullName) autoUnblock.push(String(targetAccountObj.fullName))
+      }
+
+      if (autoUnblock.length > 0) {
         const unblockLower = new Set(
-          unblockAccountIdentities
+          autoUnblock
             .map((v: any) => String(v || '').toLowerCase().trim())
             .filter(Boolean)
         )
@@ -826,7 +1024,15 @@ export async function POST(request: Request) {
       cachedDeletedAccountIds = Array.from(combinedDelAccSet)
 
       if (Array.isArray(cachedAccounts)) {
+        const prevLen = cachedAccounts.length
         cachedAccounts = cachedAccounts.filter((a: any) => !isAccountDeletedBySet(a, combinedDelAccSet))
+        if (action === 'delete_account' && cachedAccounts.length !== prevLen) {
+          await saveSetting(
+            'issac_issued_accounts_cloud',
+            JSON.stringify(cachedAccounts),
+            'Cloud synchronized issued accounts for iSSAC Web'
+          )
+        }
       }
 
       await saveSetting(
@@ -910,9 +1116,14 @@ export async function POST(request: Request) {
             return {
               ...evt,
               ...evUpdates,
-              // Bảo toàn danh sách check-in và đăng ký hiện có trên server
-              records: evt.records || evUpdates.records || {},
-              registeredMemberCodes: evUpdates.registeredMemberCodes || evt.registeredMemberCodes || [],
+              records: {
+                ...(evt.records || {}),
+                ...(evUpdates.records || {}),
+              },
+              registeredMemberCodes: Array.isArray(evUpdates.registeredMemberCodes)
+                ? evUpdates.registeredMemberCodes
+                : evt.registeredMemberCodes || [],
+              updatedAt: evUpdates.updatedAt || Date.now(),
             }
           }
           return evt
@@ -928,6 +1139,7 @@ export async function POST(request: Request) {
             return {
               ...evt,
               registeredMemberCodes: body.registeredMemberCodes,
+              updatedAt: body.updatedAt || Date.now(),
             }
           }
           return evt
@@ -939,6 +1151,7 @@ export async function POST(request: Request) {
             return {
               ...evt,
               registeredMemberCodes: cur.includes(memberCode) ? cur : [...cur, memberCode],
+              updatedAt: Date.now(),
             }
           }
           return evt
@@ -950,6 +1163,7 @@ export async function POST(request: Request) {
             return {
               ...evt,
               registeredMemberCodes: (evt.registeredMemberCodes || []).filter((c: string) => c !== memberCode),
+              updatedAt: Date.now(),
             }
           }
           return evt
@@ -968,6 +1182,7 @@ export async function POST(request: Request) {
             const isPresentStatus = resolvedStatus === 'present_on_time' || resolvedStatus === 'late'
             return {
               ...evt,
+              updatedAt: Date.now(),
               records: {
                 ...(evt.records || {}),
                 [memberCode]: {
@@ -995,6 +1210,7 @@ export async function POST(request: Request) {
             return {
               ...evt,
               isFinalized: true,
+              updatedAt: Date.now(),
               finalizedAt: new Date().toLocaleTimeString('vi-VN', {
                 timeZone: 'Asia/Ho_Chi_Minh',
                 hour: '2-digit',
@@ -1009,7 +1225,7 @@ export async function POST(request: Request) {
           return evt
         })
       } else if (events && Array.isArray(events)) {
-        // Hợp nhất events 2 chiều thông minh theo ID (tránh ghi đè mất sự kiện hoặc mất record điểm danh)
+        // Hợp nhất events 2 chiều theo timestamp để không ghi đè mất sự kiện hoặc hồi sinh người đã hủy đăng ký
         const delSet = new Set(cachedDeletedEventIds || [])
         const evtMap = new Map<string, any>()
         for (const e of updatedEvents) {
@@ -1021,17 +1237,23 @@ export async function POST(request: Request) {
             if (!existing) {
               evtMap.set(e.id, e)
             } else {
+              const exTime = getTimestampMs(existing.updatedAt)
+              const inTime = getTimestampMs(e.updatedAt)
+              const incomingWins = inTime >= exTime
+              const newer = incomingWins ? e : existing
+              const older = incomingWins ? existing : e
               evtMap.set(e.id, {
-                ...existing,
-                ...e,
-                isFinalized: existing.isFinalized || e.isFinalized,
-                registeredMemberCodes: Array.from(
-                  new Set([...(existing.registeredMemberCodes || []), ...(e.registeredMemberCodes || [])])
-                ),
+                ...older,
+                ...newer,
+                isFinalized: Boolean(existing.isFinalized || e.isFinalized),
+                registeredMemberCodes: Array.isArray(newer.registeredMemberCodes)
+                  ? newer.registeredMemberCodes
+                  : older.registeredMemberCodes || [],
                 records: {
-                  ...(existing.records || {}),
-                  ...(e.records || {}),
+                  ...(older.records || {}),
+                  ...(newer.records || {}),
                 },
+                updatedAt: Math.max(exTime, inTime) || newer.updatedAt,
               })
             }
           }
@@ -1046,64 +1268,56 @@ export async function POST(request: Request) {
 
       cachedEvents = updatedEvents
 
-      // Ghi vào bảng settings của Supabase để lưu trữ vĩnh viễn trên Cloud
-      try {
-        const { error: upsertErr } = await supabase
-          .from('settings')
-          .upsert(
-            {
-              key: 'issac_events_cloud',
-              value: JSON.stringify(updatedEvents),
-              description: 'Cloud synchronized events for iSSAC Web across mobile and desktop',
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'key' }
-          )
-
-        if (upsertErr) {
-          dbErrorMsg = upsertErr.message
-          console.warn('Supabase settings upsert notice:', upsertErr.message)
-        } else {
-          dbSuccess = true
-        }
-      } catch (dbErr: any) {
-        dbErrorMsg = dbErr?.message || 'Database error'
-        console.warn('Supabase events catch notice:', dbErr)
-      }
+      await saveSetting(
+        'issac_events_cloud',
+        JSON.stringify(updatedEvents),
+        'Cloud synchronized events for iSSAC Web across mobile and desktop'
+      )
     }
 
-    // 2. Đồng bộ & Hợp nhất Proposals 2 chiều (Chống mất dữ liệu lịch sử điểm số)
-    if (proposals !== undefined || (action === 'delete_proposal' && proposalId)) {
+    // 2. Đồng bộ & Hợp nhất Proposals 2 chiều (Chống mất dữ liệu và chống hồi sinh trạng thái cũ)
+    const isProposalAction = ['create_proposal', 'update_proposal', 'approve_proposal', 'reject_proposal', 'delete_proposal'].includes(
+      String(action || '')
+    )
+    if (proposals !== undefined || proposal !== undefined || isProposalAction) {
       if (!cachedProposals) {
-        try {
-          const { data: curRow } = await supabase
-            .from('settings')
-            .select('value')
-            .eq('key', 'issac_proposals_cloud')
-            .maybeSingle()
-          if (curRow?.value) {
-            cachedProposals = JSON.parse(curRow.value)
-          }
-        } catch (e) {
-          console.warn('Error reading current proposals before update:', e)
-        }
+        cachedProposals = await loadSettingJson<any[]>(supabase, 'issac_proposals_cloud')
       }
 
       const existingProps = cachedProposals || []
-      const incomingProps = Array.isArray(proposals) ? proposals : []
+      const incomingProps: any[] = []
+      if (proposal && typeof proposal === 'object') {
+        incomingProps.push(proposal)
+      }
+      if (Array.isArray(proposals)) {
+        incomingProps.push(...proposals)
+      }
       const deletedSet = new Set(cachedDeletedProposalIds || [])
 
       const propMap = new Map<string, any>()
-      // Thêm các proposal hiện có nếu chưa bị xóa
       for (const p of existingProps) {
         if (p?.id && !deletedSet.has(p.id) && p.status !== 'deleted') {
           propMap.set(p.id, p)
         }
       }
-      // Hợp nhất các proposal từ client (cập nhật hoặc thêm mới)
       for (const p of incomingProps) {
         if (p?.id && !deletedSet.has(p.id) && p.status !== 'deleted') {
-          propMap.set(p.id, p)
+          const existing = propMap.get(p.id)
+          if (!existing) {
+            propMap.set(p.id, p)
+          } else {
+            const exTime = getTimestampMs(existing.updatedAt || existing.reviewedAt)
+            const inTime = getTimestampMs(p.updatedAt || p.reviewedAt)
+            if (inTime > exTime) {
+              propMap.set(p.id, { ...existing, ...p })
+            } else if (inTime === exTime) {
+              const exWeight = getProposalStatusWeight(existing.status)
+              const inWeight = getProposalStatusWeight(p.status)
+              if (inWeight >= exWeight) {
+                propMap.set(p.id, { ...existing, ...p })
+              }
+            }
+          }
         }
       }
 
@@ -1213,15 +1427,21 @@ export async function POST(request: Request) {
           if (!existing) {
             dispMap.set(d.id, d)
           } else {
-            dispMap.set(d.id, {
-              ...existing,
-              ...d,
-              hrNote: d.hrNote !== undefined ? d.hrNote : existing.hrNote,
-              hrReviewedAt: d.hrReviewedAt !== undefined ? d.hrReviewedAt : existing.hrReviewedAt,
-              bcnVerdict: d.bcnVerdict !== undefined ? d.bcnVerdict : existing.bcnVerdict,
-              resolvedAt: d.resolvedAt !== undefined ? d.resolvedAt : existing.resolvedAt,
-              status: d.status || existing.status,
-            })
+            const exTime = getTimestampMs(existing.updatedAt || existing.resolvedAt || existing.hrReviewedAt)
+            const inTime = getTimestampMs(d.updatedAt || d.resolvedAt || d.hrReviewedAt)
+            const exWeight = getDisputeStatusWeight(existing.status)
+            const inWeight = getDisputeStatusWeight(d.status)
+            if (inTime > exTime || (inTime === exTime && inWeight >= exWeight)) {
+              dispMap.set(d.id, {
+                ...existing,
+                ...d,
+                hrNote: d.hrNote !== undefined ? d.hrNote : existing.hrNote,
+                hrReviewedAt: d.hrReviewedAt !== undefined ? d.hrReviewedAt : existing.hrReviewedAt,
+                bcnVerdict: d.bcnVerdict !== undefined ? d.bcnVerdict : existing.bcnVerdict,
+                resolvedAt: d.resolvedAt !== undefined ? d.resolvedAt : existing.resolvedAt,
+                status: d.status || existing.status,
+              })
+            }
           }
         }
       }
@@ -1326,7 +1546,7 @@ export async function POST(request: Request) {
       )
     }
 
-    if (accounts !== undefined || action === 'create_account' || action === 'update_account') {
+    if (accounts !== undefined || account !== undefined || action === 'create_account' || action === 'update_account') {
       if (cachedDeletedAccountIds === null) {
         cachedDeletedAccountIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_account_ids')
       }
@@ -1335,18 +1555,39 @@ export async function POST(request: Request) {
       }
       const activeDelAccSet = new Set(cachedDeletedAccountIds || [])
       const accMap = new Map<string, any>()
-      const existingAccs = Array.isArray(cachedAccounts) && cachedAccounts.length > 0 ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
+      const existingAccs =
+        cachedAccounts !== null ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
       const existingById = new Map<string, any>()
       for (const a of existingAccs) {
         if (a?.id && !isAccountDeletedBySet(a, activeDelAccSet)) {
           existingById.set(a.id, a)
         }
       }
-      // Đưa tài khoản mới tạo / cập nhật từ client lên đầu danh sách để đồng bộ thứ tự nhất quán giữa các thiết bị
+
+      const incomingAccountsList: any[] = []
+      if (account && typeof account === 'object') {
+        incomingAccountsList.push(account)
+      }
       if (Array.isArray(accounts)) {
-        for (const a of accounts) {
-          if (a?.id && !isAccountDeletedBySet(a, activeDelAccSet)) {
-            accMap.set(a.id, { ...(existingById.get(a.id) || {}), ...a })
+        incomingAccountsList.push(...accounts)
+      }
+
+      // Đưa tài khoản mới tạo / cập nhật từ client lên đầu danh sách để đồng bộ thứ tự nhất quán giữa các thiết bị
+      for (const a of incomingAccountsList) {
+        if (!a?.id || isAccountDeletedBySet(a, activeDelAccSet)) continue
+        const prev = existingById.get(a.id)
+        const already = accMap.get(a.id)
+        const base = already || prev
+        if (!base) {
+          accMap.set(a.id, { ...a, updatedAt: a.updatedAt || Date.now() })
+        } else {
+          const baseTime = getTimestampMs(base.updatedAt)
+          const inTime = getTimestampMs(a.updatedAt)
+          const isExplicitTarget = Boolean(account && account.id === a.id)
+          if (isExplicitTarget || inTime >= baseTime) {
+            accMap.set(a.id, { ...base, ...a, updatedAt: Math.max(baseTime, inTime) || a.updatedAt || base.updatedAt })
+          } else if (!already) {
+            accMap.set(a.id, base)
           }
         }
       }
@@ -1356,7 +1597,7 @@ export async function POST(request: Request) {
           accMap.set(id, existingAcc)
         }
       }
-      const cleanAccounts = Array.from(accMap.values())
+      const cleanAccounts = dedupeAccounts(Array.from(accMap.values()))
       cachedAccounts = cleanAccounts
       await saveSetting(
         'issac_issued_accounts_cloud',
@@ -1550,38 +1791,47 @@ export async function POST(request: Request) {
       )
     }
 
-    return NextResponse.json({
-      success: true,
-      events: cachedEvents,
-      activeEventId: cachedActiveEventId || '',
-      proposals: cachedProposals,
-      members: cachedMembers,
-      disputes: cachedDisputes,
-      periods: cachedPeriods,
-      activePeriodId: cachedActivePeriodId || 'month-2026-11',
-      customPeriodScores: cachedPeriodScores,
-      customRules: cachedCustomRules || [],
-      deletedProposalIds: cachedDeletedProposalIds || [],
-      deletedEventIds: cachedDeletedEventIds || [],
-      deletedPeriodIds: cachedDeletedPeriodIds || [],
-      accounts: cachedAccounts,
-      deletedAccountIds: cachedDeletedAccountIds || [],
-      deletedMemberCodes: cachedDeletedMemberCodes || [],
-      activities: cachedActivities,
-      deletedActivityIds: cachedDeletedActivityIds || [],
-      schedulePendingRequests: cachedSchedulePendingRequests || [],
-      surveyEvents: cachedSurveyEvents,
-      surveyFeedbacks: cachedSurveyFeedbacks || [],
-      deletedSurveyEventIds: cachedDeletedSurveyEventIds || [],
-      surveyCustomQuestions: cachedSurveyCustomQuestions || {},
-      bcnSurveyNotes: cachedBcnSurveyNotes || {},
-      cloudSynced: dbSuccess,
-      cloudNote: dbSuccess
-        ? 'Đã đồng bộ trực tiếp lên cơ sở dữ liệu Supabase Cloud'
-        : `Dữ liệu đang đồng bộ qua server memory cache (${dbErrorMsg || 'Cần cấp quyền SQL hoặc service_role'}). Hãy chạy script SQL mở RLS hoặc cấp SUPABASE_SERVICE_ROLE_KEY để lưu vĩnh viễn.`,
-    })
+    const allSavesOk = attemptedSaves > 0 ? succeededSaves === attemptedSaves : hasSupabaseConfig() && !dbErrorMsg
+
+    return NextResponse.json(
+      {
+        success: true,
+        events: cachedEvents,
+        activeEventId: cachedActiveEventId || '',
+        proposals: cachedProposals,
+        members: cachedMembers,
+        disputes: cachedDisputes,
+        periods: cachedPeriods,
+        activePeriodId: cachedActivePeriodId || 'month-2026-11',
+        customPeriodScores: cachedPeriodScores,
+        customRules: cachedCustomRules || [],
+        deletedProposalIds: cachedDeletedProposalIds || [],
+        deletedEventIds: cachedDeletedEventIds || [],
+        deletedPeriodIds: cachedDeletedPeriodIds || [],
+        accounts: cachedAccounts,
+        deletedAccountIds: cachedDeletedAccountIds || [],
+        deletedMemberCodes: cachedDeletedMemberCodes || [],
+        activities: cachedActivities,
+        deletedActivityIds: cachedDeletedActivityIds || [],
+        schedulePendingRequests: cachedSchedulePendingRequests || [],
+        surveyEvents: cachedSurveyEvents,
+        surveyFeedbacks: cachedSurveyFeedbacks || [],
+        deletedSurveyEventIds: cachedDeletedSurveyEventIds || [],
+        surveyCustomQuestions: cachedSurveyCustomQuestions || {},
+        bcnSurveyNotes: cachedBcnSurveyNotes || {},
+        attemptedSaves,
+        succeededSaves,
+        failedKeys,
+        cloudSynced: allSavesOk,
+        cloudError: dbErrorMsg,
+        cloudNote: allSavesOk
+          ? 'Đã đồng bộ trực tiếp lên cơ sở dữ liệu Supabase Cloud'
+          : `Dữ liệu đang đồng bộ qua server memory cache (${dbErrorMsg || 'Cần cấu hình SUPABASE_SERVICE_ROLE_KEY hoặc kiểm tra RLS bảng settings'}).`,
+      },
+      { headers: NO_STORE_HEADERS }
+    )
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Server error'
-    return NextResponse.json({ error: msg }, { status: 500 })
+    return NextResponse.json({ error: msg }, { status: 500, headers: NO_STORE_HEADERS })
   }
 }

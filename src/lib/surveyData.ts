@@ -256,12 +256,17 @@ export function deleteFeedbacksByEvent(eventName: string): SurveyFeedbackItem[] 
   }
 }
 
+let pendingSurveySync: Promise<void> | null = null
+let lastLocalSurveyMutationAt = 0
+
 // Đồng bộ dữ liệu khảo sát đa thiết bị qua Supabase Cloud API và BroadcastChannel
 export function syncSurveyToCloud(payload: Record<string, any>): void {
   if (typeof window === 'undefined') return
+  lastLocalSurveyMutationAt = Date.now()
   try {
-    fetch('/api/db/sync', {
+    const p = fetch('/api/db/sync', {
       method: 'POST',
+      keepalive: true,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
@@ -275,6 +280,12 @@ export function syncSurveyToCloud(payload: Record<string, any>): void {
         }
       })
       .catch((e) => console.error('Survey cloud sync notice:', e))
+      .finally(() => {
+        if (pendingSurveySync === p) {
+          pendingSurveySync = null
+        }
+      })
+    pendingSurveySync = p
   } catch (err) {
     console.error('Failed to trigger survey cloud sync:', err)
   }
@@ -460,6 +471,9 @@ export function applyCloudSurveyData(cloudData: {
   surveyCustomQuestions?: Record<string, SurveyQuestionItem[]>
 }): void {
   if (typeof window === 'undefined' || !cloudData) return
+  if (pendingSurveySync || Date.now() - lastLocalSurveyMutationAt < 3500) {
+    return
+  }
   let changed = false
 
   try {
@@ -493,12 +507,49 @@ export function applyCloudSurveyData(cloudData: {
       }
     }
 
-    // 3. Cập nhật danh sách nhận xét khảo sát từ cloud
+    // 3. Hợp nhất danh sách nhận xét khảo sát 2 chiều (giữ bản ghi mới hơn theo submittedAt)
     if (Array.isArray(cloudData.surveyFeedbacks)) {
-      const currentFb = localStorage.getItem(SURVEY_STORAGE_KEY)
-      const currentFbStr = currentFb || '[]'
-      const newFbStr = JSON.stringify(cloudData.surveyFeedbacks)
-      if (currentFbStr !== newFbStr) {
+      const currentFbStr = localStorage.getItem(SURVEY_STORAGE_KEY)
+      let localFbList: SurveyFeedbackItem[] = []
+      if (currentFbStr) {
+        try {
+          const parsed = JSON.parse(currentFbStr)
+          if (Array.isArray(parsed)) localFbList = parsed
+        } catch {}
+      }
+
+      const deletedEventNames = new Set(
+        getStoredSurveyEvents()
+          .filter((e) => deletedIds.has(e.id))
+          .map((e) => e.name)
+      )
+      const fbMap = new Map<string, SurveyFeedbackItem>()
+      const getFbKey = (f: SurveyFeedbackItem) =>
+        f?.event && f?.targetMemberCode && f?.evaluatorMemberCode
+          ? `${f.event}::${f.targetMemberCode}::${f.evaluatorMemberCode}`
+          : String(f?.id || Math.random())
+
+      for (const f of localFbList) {
+        if (f && !deletedEventNames.has(f.event)) fbMap.set(getFbKey(f), f)
+      }
+      for (const f of cloudData.surveyFeedbacks) {
+        if (!f || deletedEventNames.has(f.event)) continue
+        const key = getFbKey(f)
+        const prev = fbMap.get(key)
+        if (!prev) {
+          fbMap.set(key, f)
+        } else {
+          const prevTs = prev.submittedAt ? Date.parse(prev.submittedAt) : 0
+          const nextTs = f.submittedAt ? Date.parse(f.submittedAt) : 0
+          if ((Number.isFinite(nextTs) ? nextTs : 0) >= (Number.isFinite(prevTs) ? prevTs : 0)) {
+            fbMap.set(key, f)
+          }
+        }
+      }
+
+      const mergedFb = Array.from(fbMap.values())
+      const newFbStr = JSON.stringify(mergedFb)
+      if ((currentFbStr || '[]') !== newFbStr) {
         localStorage.setItem(SURVEY_STORAGE_KEY, newFbStr)
         changed = true
       }

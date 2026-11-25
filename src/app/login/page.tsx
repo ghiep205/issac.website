@@ -20,9 +20,10 @@ import { ThemeSwitch } from '@/components/layout/ThemeSwitch'
 function LoginContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
+  const reason = searchParams.get('reason')
   const redirectUrl = searchParams.get('redirect') || '/'
 
-  const { login, currentUser, isAuthChecked } = useAuth()
+  const { loginWithSync, currentUser, isAuthChecked } = useAuth()
 
   // Nếu đã đăng nhập thì tự động chuyển hướng vào hệ thống
   useEffect(() => {
@@ -38,10 +39,24 @@ function LoginContent() {
   const [loading, setLoading] = useState(false)
   const [feedback, setFeedback] = useState<{ type: 'error' | 'success'; message: string } | null>(null)
 
+  useEffect(() => {
+    if (reason === 'deleted') {
+      setFeedback({
+        type: 'error',
+        message: 'Tài khoản hoặc phiên đăng nhập trước đó đã bị Ban Chủ nhiệm gỡ quyền truy cập khỏi hệ thống.',
+      })
+    } else if (reason === 'suspended') {
+      setFeedback({
+        type: 'error',
+        message: 'Tài khoản của bạn hiện đang bị tạm khóa bởi Ban Chủ nhiệm. Vui lòng liên hệ BCN.',
+      })
+    }
+  }, [reason])
+
   // Modal quên mật khẩu
   const [showForgotModal, setShowForgotModal] = useState(false)
 
-  const handleLoginSubmit = (e: React.FormEvent) => {
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setFeedback(null)
 
@@ -62,9 +77,8 @@ function LoginContent() {
     }
 
     setLoading(true)
-
-    setTimeout(() => {
-      const result = login(account, password)
+    try {
+      const result = await loginWithSync(account, password)
       setLoading(false)
 
       if (result.success) {
@@ -74,14 +88,20 @@ function LoginContent() {
         })
         setTimeout(() => {
           router.push(redirectUrl)
-        }, 600)
+        }, 450)
       } else {
         setFeedback({
           type: 'error',
           message: result.message || 'Tài khoản hoặc mật khẩu không chính xác. Vui lòng kiểm tra lại.',
         })
       }
-    }, 350)
+    } catch {
+      setLoading(false)
+      setFeedback({
+        type: 'error',
+        message: 'Không thể kiểm tra tài khoản lúc này. Vui lòng thử lại.',
+      })
+    }
   }
 
   return (

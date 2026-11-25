@@ -371,6 +371,9 @@ export function ScheduleView() {
     return s
   })())
 
+  const pendingScheduleSyncRef = useRef<Promise<void> | null>(null)
+  const lastLocalScheduleMutationAtRef = useRef<number>(0)
+
   const syncScheduleToCloud = useCallback(
     async (payload: {
       action?: string
@@ -379,25 +382,36 @@ export function ScheduleView() {
       activities?: ActivityItem[]
       schedulePendingRequests?: PendingScheduleRequest[]
     }) => {
-      try {
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(new CustomEvent('issac_schedule_sync', { detail: payload }))
-          if (typeof BroadcastChannel !== 'undefined') {
-            try {
-              const bc = new BroadcastChannel('issac_realtime_bus')
-              bc.postMessage({ type: 'SYNC_TRIGGER' })
-              bc.close()
-            } catch {}
+      lastLocalScheduleMutationAtRef.current = Date.now()
+      let syncPromise: Promise<void> | null = null
+      syncPromise = (async () => {
+        try {
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('issac_schedule_sync', { detail: payload }))
+            if (typeof BroadcastChannel !== 'undefined') {
+              try {
+                const bc = new BroadcastChannel('issac_realtime_bus')
+                bc.postMessage({ type: 'SYNC_TRIGGER' })
+                bc.close()
+              } catch {}
+            }
+          }
+          await fetch('/api/db/sync', {
+            method: 'POST',
+            keepalive: true,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          })
+        } catch (err) {
+          console.warn('Lỗi đồng bộ lịch hoạt động lên cloud:', err)
+        } finally {
+          if (pendingScheduleSyncRef.current === syncPromise) {
+            pendingScheduleSyncRef.current = null
           }
         }
-        await fetch('/api/db/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        })
-      } catch (err) {
-        console.warn('Lỗi đồng bộ lịch hoạt động lên cloud:', err)
-      }
+      })()
+      pendingScheduleSyncRef.current = syncPromise
+      await syncPromise
     },
     []
   )
@@ -405,11 +419,19 @@ export function ScheduleView() {
   // Nạp dữ liệu lịch và các đề xuất phê duyệt mới nhất từ server / Supabase
   const fetchCloudSchedule = useCallback(async () => {
     try {
+      if (pendingScheduleSyncRef.current) {
+        await pendingScheduleSyncRef.current
+      }
+      if (Date.now() - lastLocalScheduleMutationAtRef.current < 3500) {
+        return
+      }
+      const fetchStartedAt = Date.now()
       const res = await fetch('/api/db/sync', {
         cache: 'no-store',
         headers: { 'Cache-Control': 'no-cache' },
       })
       if (!res.ok) return
+      if (lastLocalScheduleMutationAtRef.current > fetchStartedAt) return
       const data = await res.json()
       if (data.success) {
         if (Array.isArray(data.deletedActivityIds)) {

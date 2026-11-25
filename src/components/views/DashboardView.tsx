@@ -310,7 +310,7 @@ export function DashboardView({
               {t('dashboard.kpi_total_members')}
             </span>
             <span className="text-2xl sm:text-[28px] font-black text-[#0284C7] block tracking-tight leading-none py-0.5">
-              {totalMembers || 49}
+              {totalMembers}
             </span>
             <span className="text-[11.5px] font-semibold text-[#0284C7] block hover:underline">
               {t('dashboard.view_details')}

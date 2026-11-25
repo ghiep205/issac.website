@@ -15,6 +15,7 @@ export interface IssuedAccount {
   isFixed?: boolean
   avatarUrl?: string
   createdAt: string
+  updatedAt?: number
 }
 
 export const INITIAL_ISSUED_ACCOUNTS: IssuedAccount[] = [

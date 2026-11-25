@@ -139,17 +139,28 @@ export type { IssuedAccount } from './accountData'
 export { INITIAL_ISSUED_ACCOUNTS } from './accountData'
 import { INITIAL_ISSUED_ACCOUNTS, type IssuedAccount } from './accountData'
 
+export interface AccountMutationResult {
+  success: boolean
+  message: string
+  account?: IssuedAccount
+  cloudSynced?: boolean
+  syncPromise?: Promise<boolean>
+}
+
 export interface AuthContextType {
   currentUser: AuthUser | null
   isAuthChecked: boolean
   isAuthenticated: boolean
   switchUser: (userId: string) => void
   login: (account: string, password?: string) => { success: boolean; user?: AuthUser; message?: string }
+  loginWithSync: (account: string, password?: string) => Promise<{ success: boolean; user?: AuthUser; message?: string }>
   logout: () => void
   issuedAccounts: IssuedAccount[]
-  createIssuedAccount: (accountData: Omit<IssuedAccount, 'id' | 'createdAt'>) => { success: boolean; message: string }
-  updateIssuedAccount: (id: string, updates: Partial<IssuedAccount>) => { success: boolean; message: string }
-  deleteIssuedAccount: (id: string) => { success: boolean; message: string }
+  createIssuedAccount: (accountData: Omit<IssuedAccount, 'id' | 'createdAt'>) => AccountMutationResult
+  updateIssuedAccount: (id: string, updates: Partial<IssuedAccount>) => AccountMutationResult
+  deleteIssuedAccount: (id: string) => AccountMutationResult
+  refreshCloudAccounts: () => Promise<void>
+  cloudSyncError: string | null
   isBCN: boolean
   isHR: boolean
   isDeptHead: boolean
@@ -249,9 +260,110 @@ export function resolveAllAssociatedIdentities(
   return Array.from(results)
 }
 
+const DEPT_SLUG_BY_CODE: Record<string, DepartmentSlug> = {
+  B01: 'truyen-thong',
+  B02: 'tu-van',
+  B03: 'nhan-su',
+  B04: 'bcn',
+}
+
+const UNSYNCED_ACCOUNTS_KEY = 'issac_unsynced_accounts_v1'
+
+interface UnsyncedAccountRecord {
+  account: IssuedAccount
+  savedAt: number
+}
+
+function loadUnsyncedAccountRecords(): Map<string, UnsyncedAccountRecord> {
+  const map = new Map<string, UnsyncedAccountRecord>()
+  if (typeof window === 'undefined') return map
+  try {
+    const raw = localStorage.getItem(UNSYNCED_ACCOUNTS_KEY)
+    if (!raw) return map
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) {
+      for (const entry of parsed) {
+        if (entry?.account?.id) {
+          map.set(entry.account.id, entry)
+        }
+      }
+    }
+  } catch {}
+  return map
+}
+
+function persistUnsyncedAccountRecords(map: Map<string, UnsyncedAccountRecord>) {
+  if (typeof window === 'undefined') return
+  try {
+    const entries = Array.from(map.values())
+    if (entries.length === 0) {
+      localStorage.removeItem(UNSYNCED_ACCOUNTS_KEY)
+    } else {
+      localStorage.setItem(UNSYNCED_ACCOUNTS_KEY, JSON.stringify(entries))
+    }
+  } catch {}
+}
+
+function resolveAuthUserSession(params: {
+  issued?: IssuedAccount
+  member?: RosterMember
+  preset?: AuthUser
+}): AuthUser {
+  const { issued, member, preset } = params
+  let finalRole: UserRole = 'member'
+  let finalRoleTitle = ''
+  let isCore = false
+
+  if (issued && (!member || !issued.isFixed)) {
+    finalRole = issued.role
+    finalRoleTitle = issued.roleTitle
+    isCore = issued.role === 'bcn' || issued.role === 'admin' || issued.role === 'hr' || issued.role === 'dept_head'
+    if (
+      issued.departmentSlug === 'nhan-su' &&
+      issued.role !== 'bcn' &&
+      issued.role !== 'admin' &&
+      (issued.roleTitle.includes('Trưởng') || issued.roleTitle.includes('Phó'))
+    ) {
+      finalRole = 'hr'
+      isCore = true
+    } else if (issued.role === 'member' && member?.is_core) {
+      isCore = true
+    }
+  } else if (member) {
+    const derived = getRoleForMember(member)
+    finalRole = derived.role
+    isCore = derived.isCore
+    finalRoleTitle = derived.roleTitle
+  } else if (preset) {
+    finalRole = preset.role
+    finalRoleTitle = preset.roleTitle
+    isCore = preset.isCore
+  }
+
+  const cleanIssuedStudentId =
+    issued?.studentId && issued.studentId.toUpperCase() !== 'STAFF-001' ? issued.studentId : undefined
+
+  return {
+    id: issued?.id || member?.member_code || preset?.id || `user-${Date.now()}`,
+    name: issued?.fullName || member?.full_name || preset?.name || 'Thành viên iSSAC',
+    role: finalRole,
+    roleTitle:
+      finalRoleTitle ||
+      issued?.roleTitle ||
+      `${member?.position || 'Thành viên'} - ${member?.department_name || 'CLB iSSAC'}`,
+    departmentCode: issued?.departmentCode || member?.department_code || preset?.departmentCode,
+    departmentName: issued?.departmentName || member?.department_name || preset?.departmentName,
+    memberCode: member?.member_code || cleanIssuedStudentId || preset?.memberCode || issued?.id || member?.student_id,
+    isCore,
+    avatarBg: 'bg-blue-600',
+    avatarUrl: issued?.avatarUrl || member?.avatar_url || preset?.avatarUrl,
+  }
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null)
   const [isAuthChecked, setIsAuthChecked] = useState(false)
+  const [cloudSyncError, setCloudSyncError] = useState<string | null>(null)
   const [issuedAccounts, setIssuedAccounts] = useState<IssuedAccount[]>(() => {
     return INITIAL_ISSUED_ACCOUNTS.filter((a) => !DEFAULT_DELETED_ACCOUNT_IDS.includes(a.id))
   })
@@ -261,8 +373,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [issuedAccounts])
   const cloudMembersRef = useRef<RosterMember[]>(INITIAL_MEMBERS)
   const deletedAccountIdsRef = useRef<Set<string>>(new Set(DEFAULT_DELETED_ACCOUNT_IDS))
-  const pendingAccountSyncRef = useRef<Promise<void> | null>(null)
+  const unsyncedLocalAccountsRef = useRef<Map<string, UnsyncedAccountRecord>>(new Map())
+  const pendingAccountSyncRef = useRef<Promise<boolean> | null>(null)
   const lastLocalAccountMutationAtRef = useRef<number>(0)
+  const lastUnsyncedRetryAtRef = useRef<number>(0)
+
+  const commitIssuedAccounts = useCallback((nextList: IssuedAccount[]) => {
+    issuedAccountsRef.current = nextList
+    setIssuedAccounts(nextList)
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem('issac_issued_accounts', JSON.stringify(nextList))
+      } catch (e) {
+        console.error(e)
+      }
+    }
+  }, [])
 
   // Kiểm tra một chuỗi bất kỳ có nằm trong danh sách đã bị xóa không
   const isIdentityDeleted = useCallback((val?: string | null): boolean => {
@@ -298,43 +424,80 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   )
 
   // Helper gửi danh sách tài khoản lên Supabase Cloud API để Máy tính và Điện thoại cùng đồng bộ
-  const syncAccountsToCloud = (payload: {
-    accounts?: IssuedAccount[]
-    deletedAccountIds?: string[]
-    deletedMemberCodes?: string[]
-    unblockAccountIdentities?: string[]
-    action?: string
-    accountId?: string
-    studentId?: string
-    email?: string
-    fullName?: string
-  }) => {
-    if (typeof window !== 'undefined') {
+  const syncAccountsToCloud = useCallback(
+    (payload: {
+      account?: IssuedAccount
+      accounts?: IssuedAccount[]
+      deletedAccountIds?: string[]
+      deletedMemberCodes?: string[]
+      unblockAccountIdentities?: string[]
+      action?: string
+      accountId?: string
+      studentId?: string
+      email?: string
+      fullName?: string
+    }): Promise<boolean> => {
+      if (typeof window === 'undefined') return Promise.resolve(false)
+
       const p = fetch('/api/db/sync', {
         method: 'POST',
+        keepalive: true,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
-        .then((res) => {
-          if (res.ok && typeof BroadcastChannel !== 'undefined') {
+        .then(async (res) => {
+          const data = await res.json().catch(() => null)
+          if (!res.ok || !data || data.cloudSynced === false) {
+            const errText =
+              data?.cloudError ||
+              data?.cloudNote ||
+              data?.error ||
+              `Đồng bộ Cloud thất bại (HTTP ${res.status})`
+            setCloudSyncError(errText)
+            return false
+          }
+
+          setCloudSyncError(null)
+          if (Array.isArray(data.accounts)) {
+            const cloudIds = new Set(data.accounts.map((a: any) => a?.id).filter(Boolean))
+            let changedUnsynced = false
+            for (const [unsyncedId] of Array.from(unsyncedLocalAccountsRef.current.entries())) {
+              if (cloudIds.has(unsyncedId)) {
+                unsyncedLocalAccountsRef.current.delete(unsyncedId)
+                changedUnsynced = true
+              }
+            }
+            if (changedUnsynced) {
+              persistUnsyncedAccountRecords(unsyncedLocalAccountsRef.current)
+            }
+          }
+
+          if (typeof BroadcastChannel !== 'undefined') {
             try {
               const bc = new BroadcastChannel('issac_realtime_bus')
               bc.postMessage({ type: 'SYNC_TRIGGER' })
               bc.close()
             } catch {}
           }
+          return true
         })
-        .catch((e) => console.error('Cloud account sync notice:', e))
+        .catch((e) => {
+          console.error('Cloud account sync notice:', e)
+          setCloudSyncError('Không thể kết nối Cloud để lưu tài khoản. Hệ thống sẽ tự đồng bộ lại khi có mạng.')
+          return false
+        })
         .finally(() => {
           if (pendingAccountSyncRef.current === p) {
             pendingAccountSyncRef.current = null
           }
         })
       pendingAccountSyncRef.current = p
-    }
-  }
+      return p
+    },
+    []
+  )
 
-  // Tải và hợp nhất tài khoản đám mây (Chống hồi sinh tài khoản đã xóa khi chuyển giữa ĐT và Máy tính)
+  // Tải và hợp nhất tài khoản đám mây (Chống mất tài khoản mới tạo và chống hồi sinh tài khoản đã xóa)
   const fetchCloudAccounts = useCallback(async () => {
     try {
       if (pendingAccountSyncRef.current) {
@@ -352,149 +515,260 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       const data = await res.json()
 
-        if (data.members && Array.isArray(data.members) && data.members.length > 0) {
-          cloudMembersRef.current = data.members
-        }
+      if (data.members && Array.isArray(data.members) && data.members.length > 0) {
+        cloudMembersRef.current = data.members
+      }
 
-        // Thu thập email/MSSV của các tài khoản đang hoạt động trên Cloud để không mở rộng nhầm tombstone cũ đè lên tài khoản vừa cấp lại
-        const activeAccountKeys = new Set<string>()
-        if (Array.isArray(data.accounts)) {
-          for (const ca of data.accounts) {
-            if (ca?.email) activeAccountKeys.add(String(ca.email).toLowerCase().trim())
-            if (ca?.studentId) activeAccountKeys.add(String(ca.studentId).toLowerCase().trim())
+      // Thu thập identity của các tài khoản ĐANG HOẠT ĐỘNG trên Cloud
+      const activeCloudKeys = new Set<string>()
+      const cloudAccountsArr: IssuedAccount[] = Array.isArray(data.accounts) ? data.accounts : []
+      for (const ca of cloudAccountsArr) {
+        if (ca?.id) activeCloudKeys.add(String(ca.id).toLowerCase().trim())
+        if (ca?.email) activeCloudKeys.add(String(ca.email).toLowerCase().trim())
+        if (ca?.studentId && String(ca.studentId).toUpperCase() !== 'STAFF-001') {
+          activeCloudKeys.add(String(ca.studentId).toLowerCase().trim())
+        }
+      }
+
+      const unsyncedKeys = new Set<string>()
+      for (const { account } of unsyncedLocalAccountsRef.current.values()) {
+        if (account.id) unsyncedKeys.add(account.id.toLowerCase().trim())
+        if (account.email) unsyncedKeys.add(account.email.toLowerCase().trim())
+        if (account.studentId && account.studentId.toUpperCase() !== 'STAFF-001') {
+          unsyncedKeys.add(account.studentId.toLowerCase().trim())
+        }
+      }
+
+      // 1. Đồng bộ tombstones hai chiều từ Cloud:
+      //    - Gỡ các định danh đã được Cloud cấp lại tài khoản mới
+      //    - Nạp thêm các tài khoản bị xóa trên thiết bị khác
+      const skipTombstoneOverwrite = Date.now() - lastLocalAccountMutationAtRef.current < 4000
+      const defaultThangSet = new Set(DEFAULT_DELETED_ACCOUNT_IDS.map((s) => s.toLowerCase().trim()))
+      const cloudDeletedArr: string[] = Array.isArray(data.deletedAccountIds) ? data.deletedAccountIds : []
+      const cloudDeletedLower = new Set(cloudDeletedArr.map((s) => String(s || '').toLowerCase().trim()).filter(Boolean))
+
+      // Nếu thiết bị khác vừa gỡ chặn (re-issue) một người -> gỡ khỏi deletedAccountIdsRef local
+      if (!skipTombstoneOverwrite) {
+        for (const existingDel of Array.from(deletedAccountIdsRef.current)) {
+          const cleanDel = existingDel.toLowerCase().trim()
+          if (activeCloudKeys.has(cleanDel) && !cloudDeletedLower.has(cleanDel)) {
+            deletedAccountIdsRef.current.delete(existingDel)
           }
         }
-        for (const la of issuedAccountsRef.current) {
-          if (la?.email) activeAccountKeys.add(String(la.email).toLowerCase().trim())
-          if (la?.studentId) activeAccountKeys.add(String(la.studentId).toLowerCase().trim())
+      }
+
+      if (!skipTombstoneOverwrite && cloudDeletedArr.length > 0) {
+        for (const rawId of cloudDeletedArr) {
+          if (!rawId) continue
+          const cleanRaw = rawId.toLowerCase().trim()
+          if ((activeCloudKeys.has(cleanRaw) || unsyncedKeys.has(cleanRaw)) && !defaultThangSet.has(cleanRaw)) {
+            continue
+          }
+          deletedAccountIdsRef.current.add(rawId)
+          deletedAccountIdsRef.current.add(cleanRaw)
+          if (defaultThangSet.has(cleanRaw)) {
+            const aliases = resolveAllAssociatedIdentities(rawId, issuedAccountsRef.current)
+            for (const a of aliases) {
+              deletedAccountIdsRef.current.add(a)
+              deletedAccountIdsRef.current.add(a.toLowerCase())
+            }
+          }
+        }
+      }
+
+      try {
+        localStorage.setItem('issac_deleted_account_ids', JSON.stringify(Array.from(deletedAccountIdsRef.current)))
+      } catch {}
+
+      // 2. Hợp nhất danh sách tài khoản (bảo toàn unsynced local accounts đến khi Cloud xác nhận)
+      let nextCleanAccounts = issuedAccountsRef.current
+      if (Array.isArray(data.accounts)) {
+        const mergedMap = new Map<string, IssuedAccount>()
+        const cloudIds = new Set<string>()
+        const cloudById = new Map<string, IssuedAccount>()
+        for (const ca of cloudAccountsArr) {
+          if (ca?.id && !isEntityDeleted(ca)) {
+            cloudIds.add(ca.id)
+            cloudById.set(ca.id, ca)
+          }
         }
 
-        // 1. Đồng bộ tombstones các tài khoản đã xóa từ cloud (tách biệt với issac_deleted_member_codes)
-        const skipTombstoneOverwrite = Date.now() - lastLocalAccountMutationAtRef.current < 2500
-        const defaultThangSet = new Set(DEFAULT_DELETED_ACCOUNT_IDS.map((s) => s.toLowerCase().trim()))
-        const cloudDeleted: string[] = []
-        if (!skipTombstoneOverwrite && data.deletedAccountIds && Array.isArray(data.deletedAccountIds)) {
-          cloudDeleted.push(...data.deletedAccountIds)
+        // Đặt các thay đổi local chưa xác nhận (hoặc mới hơn Cloud) lên đầu
+        const remainingUnsynced: IssuedAccount[] = []
+        let unsyncedChanged = false
+        for (const [id, entry] of Array.from(unsyncedLocalAccountsRef.current.entries())) {
+          if (isEntityDeleted(entry.account)) {
+            unsyncedLocalAccountsRef.current.delete(id)
+            unsyncedChanged = true
+            continue
+          }
+          const cloudMatch = cloudById.get(id)
+          const cloudUpdated = Number(cloudMatch?.updatedAt || 0)
+          const localUpdated = Number(entry.account.updatedAt || entry.savedAt || 0)
+          if (cloudMatch && cloudUpdated >= localUpdated) {
+            // Cloud đã nhận phiên bản mới nhất
+            unsyncedLocalAccountsRef.current.delete(id)
+            unsyncedChanged = true
+          } else {
+            mergedMap.set(id, entry.account)
+            remainingUnsynced.push(entry.account)
+          }
+        }
+        if (unsyncedChanged) {
+          persistUnsyncedAccountRecords(unsyncedLocalAccountsRef.current)
         }
 
-        if (cloudDeleted.length > 0) {
-          for (const rawId of cloudDeleted) {
-            if (!rawId) continue
-            const cleanRaw = rawId.toLowerCase().trim()
-            if (activeAccountKeys.has(cleanRaw) && !defaultThangSet.has(cleanRaw)) {
-              continue
-            }
-            deletedAccountIdsRef.current.add(rawId)
-            deletedAccountIdsRef.current.add(cleanRaw)
-            if (defaultThangSet.has(cleanRaw)) {
-              const aliases = resolveAllAssociatedIdentities(rawId, issuedAccountsRef.current)
-              for (const a of aliases) {
-                deletedAccountIdsRef.current.add(a)
-                deletedAccountIdsRef.current.add(a.toLowerCase())
-              }
-            }
+        // Nạp danh sách từ Cloud
+        for (const cloudAcc of cloudAccountsArr) {
+          if (cloudAcc?.id && !isEntityDeleted(cloudAcc) && !mergedMap.has(cloudAcc.id)) {
+            mergedMap.set(cloudAcc.id, cloudAcc)
+          }
+        }
+
+        nextCleanAccounts = Array.from(mergedMap.values()).filter((a) => !isEntityDeleted(a))
+        setIssuedAccounts((prev) => {
+          issuedAccountsRef.current = nextCleanAccounts
+          if (JSON.stringify(nextCleanAccounts) === JSON.stringify(prev)) {
+            return prev
           }
           try {
-            const arr = Array.from(deletedAccountIdsRef.current)
-            localStorage.setItem('issac_deleted_account_ids', JSON.stringify(arr))
-          } catch (e) {}
-        }
+            localStorage.setItem('issac_issued_accounts', JSON.stringify(nextCleanAccounts))
+          } catch {}
+          return nextCleanAccounts
+        })
 
-        // 2. Hợp nhất danh sách tài khoản
-        if (data.accounts && Array.isArray(data.accounts)) {
-          setIssuedAccounts((prev) => {
-            const prevMap = new Map(prev.map((a) => [a.id, a]))
-            const mergedMap = new Map<string, IssuedAccount>()
-            // Giữ tài khoản mới tạo ở local (trong vòng 30s hoặc vừa đẩy lên) lên trước
-            for (const cloudAcc of data.accounts) {
-              if (cloudAcc?.id && !isEntityDeleted(cloudAcc)) {
-                mergedMap.set(cloudAcc.id, {
-                  ...(prevMap.get(cloudAcc.id) || {}),
-                  ...cloudAcc,
-                })
-              }
-            }
-            for (const localAcc of prev) {
-              if (localAcc?.id && !mergedMap.has(localAcc.id) && !isEntityDeleted(localAcc)) {
-                // Nếu localAcc mới vừa tạo tại phiên này nhưng cloud chưa kịp nhận, giữ lại ở đầu
-                if (skipTombstoneOverwrite) {
-                  mergedMap.set(localAcc.id, localAcc)
-                }
-              }
-            }
-            const cleanList = Array.from(mergedMap.values()).filter((a) => !isEntityDeleted(a))
-            issuedAccountsRef.current = cleanList
-            if (JSON.stringify(cleanList) === JSON.stringify(prev)) {
-              return prev
-            }
-            try {
-              localStorage.setItem('issac_issued_accounts', JSON.stringify(cleanList))
-            } catch (e) {}
-            return cleanList
-          })
-        } else {
-          setIssuedAccounts((prev) => {
-            const clean = prev.filter((a) => !isEntityDeleted(a))
-            issuedAccountsRef.current = clean
-            if (clean.length === prev.length) {
-              return prev
-            }
-            try {
-              localStorage.setItem('issac_issued_accounts', JSON.stringify(clean))
-            } catch (e) {}
-            return clean
+        // Nếu còn tài khoản local chưa lên được Cloud (do lỗi mạng / cold-start), tự đẩy lại mỗi 10s
+        if (
+          remainingUnsynced.length > 0 &&
+          !pendingAccountSyncRef.current &&
+          Date.now() - lastUnsyncedRetryAtRef.current > 10000
+        ) {
+          lastUnsyncedRetryAtRef.current = Date.now()
+          const target = remainingUnsynced[0]
+          syncAccountsToCloud({
+            action: 'create_account',
+            account: target,
+            accounts: remainingUnsynced,
+            unblockAccountIdentities: [
+              target.id,
+              target.email,
+              target.studentId || '',
+              target.fullName,
+            ].filter(Boolean),
           })
         }
+      } else {
+        setIssuedAccounts((prev) => {
+          const clean = prev.filter((a) => !isEntityDeleted(a))
+          issuedAccountsRef.current = clean
+          nextCleanAccounts = clean
+          if (clean.length === prev.length) {
+            return prev
+          }
+          try {
+            localStorage.setItem('issac_issued_accounts', JSON.stringify(clean))
+          } catch {}
+          return clean
+        })
+      }
 
-        // 3. FORCE LOGOUT REAL-TIME TRÊN TẤT CẢ CÁC THIẾT BỊ:
-        // Nếu người dùng hiện đang đăng nhập thuộc bất kỳ tài khoản/thành viên nào bị xóa -> ĐĂNG XUẤT NGAY
-        setCurrentUser((current) => {
-          if (current && isEntityDeleted(current)) {
+      // 3. FORCE LOGOUT & LIVE ROLE SYNC REAL-TIME TRÊN TẤT CẢ THIẾT BỊ:
+      const latestMembers: RosterMember[] = Array.isArray(data.members) && data.members.length > 0
+        ? data.members
+        : cloudMembersRef.current
+
+      setCurrentUser((current) => {
+        if (current) {
+          if (isEntityDeleted(current)) {
             try {
               localStorage.removeItem('issac_active_user')
-            } catch (e) {}
+            } catch {}
             if (typeof window !== 'undefined') {
-              window.dispatchEvent(
-                new CustomEvent('issac_account_deleted', { detail: { user: current } })
-              )
+              window.dispatchEvent(new CustomEvent('issac_account_deleted', { detail: { user: current } }))
               if (window.location.pathname !== '/login') {
                 window.location.href = '/login?reason=deleted'
               }
             }
             return null
           }
-          if (!current && typeof window !== 'undefined') {
-            const saved = localStorage.getItem('issac_active_user')
-            if (saved && !isIdentityDeleted(saved) && Array.isArray(data.members)) {
-              const foundCloudMem = data.members.find(
-                (m: any) => (m.member_code === saved || m.student_id === saved) && !isEntityDeleted(m)
-              )
-              if (foundCloudMem) {
-                const roleInfo = getRoleForMember(foundCloudMem)
-                return {
-                  id: foundCloudMem.member_code,
-                  name: foundCloudMem.full_name,
-                  role: roleInfo.role,
-                  roleTitle: roleInfo.roleTitle,
-                  departmentCode: foundCloudMem.department_code,
-                  departmentName: foundCloudMem.department_name,
-                  memberCode: foundCloudMem.member_code,
-                  isCore: roleInfo.isCore,
-                  avatarBg: 'bg-blue-600',
-                  avatarUrl: foundCloudMem.avatar_url,
-                }
+
+          const matchedIssued = nextCleanAccounts.find(
+            (a) =>
+              a.id === current.id ||
+              (!a.isFixed &&
+                a.studentId &&
+                a.studentId.toUpperCase() !== 'STAFF-001' &&
+                current.memberCode &&
+                a.studentId.toLowerCase() === current.memberCode.toLowerCase())
+          )
+          if (matchedIssued?.status === 'suspended') {
+            try {
+              localStorage.removeItem('issac_active_user')
+            } catch {}
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('issac_account_suspended', { detail: { user: current } }))
+              if (window.location.pathname !== '/login') {
+                window.location.href = '/login?reason=suspended'
               }
             }
+            return null
           }
-          return current
-        })
-    } catch (err) {
+
+          const matchedMember = latestMembers.find(
+            (m) =>
+              (current.memberCode && m.member_code === current.memberCode) ||
+              (matchedIssued?.studentId &&
+                matchedIssued.studentId.toUpperCase() !== 'STAFF-001' &&
+                (m.student_id === matchedIssued.studentId || m.member_code === matchedIssued.studentId))
+          )
+
+          if (matchedIssued && (!matchedMember || !matchedIssued.isFixed)) {
+            const refreshed = resolveAuthUserSession({ issued: matchedIssued, member: matchedMember })
+            if (
+              refreshed.role !== current.role ||
+              refreshed.roleTitle !== current.roleTitle ||
+              refreshed.departmentCode !== current.departmentCode ||
+              refreshed.name !== current.name
+            ) {
+              return refreshed
+            }
+          }
+        }
+
+        if (!current && typeof window !== 'undefined') {
+          const saved = localStorage.getItem('issac_active_user')
+          if (saved && !isIdentityDeleted(saved)) {
+            const foundCloudIssued = nextCleanAccounts.find(
+              (a) =>
+                (a.id === saved ||
+                  (a.studentId && a.studentId.toUpperCase() !== 'STAFF-001' && a.studentId === saved) ||
+                  a.email.toLowerCase() === saved.toLowerCase()) &&
+                a.status !== 'suspended' &&
+                !isEntityDeleted(a)
+            )
+            const foundCloudMem = latestMembers.find(
+              (m) =>
+                ((m.member_code === saved || m.student_id === saved) && !isEntityDeleted(m)) ||
+                (foundCloudIssued?.studentId &&
+                  foundCloudIssued.studentId.toUpperCase() !== 'STAFF-001' &&
+                  (m.student_id === foundCloudIssued.studentId || m.member_code === foundCloudIssued.studentId))
+            )
+            if (foundCloudIssued || foundCloudMem) {
+              return resolveAuthUserSession({ issued: foundCloudIssued, member: foundCloudMem })
+            }
+          }
+        }
+        return current
+      })
+    } catch {
       // Offline fallback
     }
-  }, [isEntityDeleted])
+  }, [isEntityDeleted, isIdentityDeleted, syncAccountsToCloud])
 
   // Load saved accounts & active user from localStorage
   useEffect(() => {
+    unsyncedLocalAccountsRef.current = loadUnsyncedAccountRecords()
+
     // Chỉ nạp tombstones tài khoản (tách biệt hoàn toàn với danh sách xóa thành viên)
     try {
       const savedDelAccs = localStorage.getItem('issac_deleted_account_ids')
@@ -507,18 +781,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           })
         }
       }
-    } catch (e) {}
+    } catch {}
 
+    let initialAccList: IssuedAccount[] = []
     try {
       const savedAccs = localStorage.getItem('issac_issued_accounts')
-      const localAccounts: IssuedAccount[] = savedAccs ? JSON.parse(savedAccs) : INITIAL_ISSUED_ACCOUNTS
+      const baseAccounts: IssuedAccount[] = savedAccs ? JSON.parse(savedAccs) : INITIAL_ISSUED_ACCOUNTS
+      const accById = new Map<string, IssuedAccount>()
+      for (const { account } of unsyncedLocalAccountsRef.current.values()) {
+        if (account?.id) accById.set(account.id, account)
+      }
+      for (const a of baseAccounts) {
+        if (a?.id && !accById.has(a.id)) accById.set(a.id, a)
+      }
+      const mergedLocal = Array.from(accById.values())
+
       const activeEmailOrStudentSet = new Set<string>()
-      localAccounts.forEach((a) => {
+      mergedLocal.forEach((a) => {
         if (a?.email) activeEmailOrStudentSet.add(a.email.toLowerCase().trim())
-        if (a?.studentId) activeEmailOrStudentSet.add(a.studentId.toLowerCase().trim())
+        if (a?.studentId && a.studentId.toUpperCase() !== 'STAFF-001') {
+          activeEmailOrStudentSet.add(a.studentId.toLowerCase().trim())
+        }
       })
 
-      // Chỉ mở rộng đầy đủ aliases mặc định (Trần Đức Thắng); các ID cũ khác giữ nguyên nếu đang có tài khoản mới hoạt động
       const defaultThangSet = new Set(DEFAULT_DELETED_ACCOUNT_IDS.map((s) => s.toLowerCase().trim()))
       const initialDelList = Array.from(deletedAccountIdsRef.current)
       for (const d of initialDelList) {
@@ -530,36 +815,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           })
         }
       }
-      // Đảm bảo email/MSSV của tài khoản vừa cấp ở local không bị xóa nhầm bởi alias cũ
       activeEmailOrStudentSet.forEach((val) => {
         if (!defaultThangSet.has(val)) {
           deletedAccountIdsRef.current.delete(val)
         }
       })
 
-      const clean = localAccounts.filter((a) => !isEntityDeleted(a))
-      issuedAccountsRef.current = clean
-      setIssuedAccounts(clean)
+      initialAccList = mergedLocal.filter((a) => !isEntityDeleted(a))
+      commitIssuedAccounts(initialAccList)
     } catch (err) {
       console.error(err)
     }
 
+    let resolvedLocally = false
+    let savedIdentifier: string | null = null
     try {
       const urlParams =
         typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null
       const paramUser = urlParams?.get('user')
-      const saved = paramUser || localStorage.getItem('issac_active_user')
-      if (saved && !isIdentityDeleted(saved)) {
-        // 1. Check preset users
-        const foundPreset = PRESET_USERS.find((u) => u.id === saved && !isEntityDeleted(u))
-        if (foundPreset) {
-          setCurrentUser(foundPreset)
-          setIsAuthChecked(true)
-          fetchCloudAccounts()
-          return
-        }
+      savedIdentifier = paramUser || localStorage.getItem('issac_active_user')
 
-        // 2. Check full roster (default + newly added/updated members cached locally)
+      if (savedIdentifier && !isIdentityDeleted(savedIdentifier)) {
+        const cleanSaved = savedIdentifier.trim().toLowerCase()
+
+        // 1. Nạp danh sách thành viên local (để gắn thông tin thành viên nếu có)
         let localRoster: RosterMember[] = cloudMembersRef.current
         try {
           const savedMembersStr = localStorage.getItem('issac_members_clean_v1')
@@ -577,71 +856,62 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         } catch {}
 
-        const foundMember = localRoster.find(
-          (m) => (m.member_code === saved || m.student_id === saved) && !isEntityDeleted(m)
-        )
-        if (foundMember) {
-          const roleInfo = getRoleForMember(foundMember)
-          setCurrentUser({
-            id: foundMember.member_code,
-            name: foundMember.full_name,
-            role: roleInfo.role,
-            roleTitle: roleInfo.roleTitle,
-            departmentCode: foundMember.department_code,
-            departmentName: foundMember.department_name,
-            memberCode: foundMember.member_code,
-            isCore: roleInfo.isCore,
-            avatarBg: 'bg-blue-600',
-            avatarUrl: foundMember.avatar_url,
-          })
+        // 2. Check preset users (như user-bcn, user-hr...)
+        const foundPreset = PRESET_USERS.find((u) => u.id === savedIdentifier && !isEntityDeleted(u))
+        if (foundPreset) {
+          setCurrentUser(foundPreset)
           setIsAuthChecked(true)
-          fetchCloudAccounts()
-          return
-        }
+          resolvedLocally = true
+        } else {
+          const accSource = initialAccList.length > 0 ? initialAccList : INITIAL_ISSUED_ACCOUNTS
+          const foundIssued = accSource.find(
+            (a) =>
+              !isEntityDeleted(a) &&
+              a.status !== 'suspended' &&
+              (a.id === savedIdentifier ||
+                a.email.toLowerCase() === cleanSaved ||
+                (!a.isFixed && a.studentId && a.studentId.toLowerCase() === cleanSaved))
+          )
+          const foundMember = localRoster.find(
+            (m) =>
+              !isEntityDeleted(m) &&
+              (m.member_code === savedIdentifier ||
+                m.student_id === savedIdentifier ||
+                (foundIssued?.studentId &&
+                  foundIssued.studentId.toUpperCase() !== 'STAFF-001' &&
+                  (m.student_id === foundIssued.studentId || m.member_code === foundIssued.studentId)))
+          )
 
-        // 3. Check issued accounts
-        const savedAccsStr = localStorage.getItem('issac_issued_accounts')
-        const accList: IssuedAccount[] = savedAccsStr
-          ? JSON.parse(savedAccsStr)
-          : INITIAL_ISSUED_ACCOUNTS
-        const foundIssued = accList.find(
-          (a: any) =>
-            (a.id === saved || a.studentId === saved || a.email === saved) &&
-            !isEntityDeleted(a)
-        )
-        if (foundIssued) {
-          setCurrentUser({
-            id: foundIssued.id,
-            name: foundIssued.fullName,
-            role: foundIssued.role,
-            roleTitle: foundIssued.roleTitle,
-            departmentCode: foundIssued.departmentCode,
-            departmentName: foundIssued.departmentName,
-            memberCode: foundIssued.studentId || foundIssued.id,
-            isCore:
-              foundIssued.role === 'bcn' ||
-              foundIssued.role === 'hr' ||
-              foundIssued.role === 'dept_head',
-            avatarBg: 'bg-blue-600',
-          })
-          setIsAuthChecked(true)
-          fetchCloudAccounts()
-          return
+          if (foundIssued || foundMember) {
+            setCurrentUser(resolveAuthUserSession({ issued: foundIssued, member: foundMember }))
+            setIsAuthChecked(true)
+            resolvedLocally = true
+          }
         }
-      } else if (saved && isIdentityDeleted(saved)) {
-        // Nếu user lưu trong local storage nằm trong blacklist -> Xóa ngay
+      } else if (savedIdentifier && isIdentityDeleted(savedIdentifier)) {
         try {
           localStorage.removeItem('issac_active_user')
-        } catch (e) {}
+        } catch {}
       }
     } catch (e) {
       console.error(e)
     }
 
-    setCurrentUser(null)
-    setIsAuthChecked(true)
-    fetchCloudAccounts()
-  }, [fetchCloudAccounts, isEntityDeleted, isIdentityDeleted])
+    if (!resolvedLocally) {
+      if (savedIdentifier && !isIdentityDeleted(savedIdentifier)) {
+        // Đợi tải Cloud trước khi chuyển hướng /login phòng trường hợp cache local trống nhưng Cloud vẫn có user
+        fetchCloudAccounts().finally(() => {
+          setIsAuthChecked(true)
+        })
+      } else {
+        setCurrentUser(null)
+        setIsAuthChecked(true)
+        fetchCloudAccounts()
+      }
+    } else {
+      fetchCloudAccounts()
+    }
+  }, [commitIssuedAccounts, fetchCloudAccounts, isEntityDeleted, isIdentityDeleted])
 
   // Lắng nghe visibilitychange, storage và chu kỳ polling 3 giây để cập nhật tài khoản trên mọi thiết bị
   useEffect(() => {
@@ -757,7 +1027,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  const createIssuedAccount = (data: Omit<IssuedAccount, 'id' | 'createdAt'>) => {
+  const createIssuedAccount = (data: Omit<IssuedAccount, 'id' | 'createdAt'>): AccountMutationResult => {
     // Chỉ Ban Chủ nhiệm mới có thể cấp tài khoản
     if (!canUserManageAccounts(currentUser)) {
       return { success: false, message: 'Chỉ Ban Chủ nhiệm mới có quyền cấp tài khoản cán bộ!' }
@@ -796,21 +1066,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    const nowTs = Date.now()
     const newAcc: IssuedAccount = {
       ...data,
+      departmentSlug: data.departmentSlug || DEPT_SLUG_BY_CODE[data.departmentCode] || 'truyen-thong',
       fullName: cleanName,
       email: cleanEmail,
       studentId: cleanStudentId || undefined,
       passwordPlain: cleanPassword,
       roleTitle: (data.roleTitle || 'Thành viên CLB iSSAC').trim(),
-      id: `acc-${Date.now()}`,
+      status: data.status || 'active',
+      id: `acc-${nowTs}-${Math.random().toString(36).slice(2, 7)}`,
       createdAt: new Date().toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),
+      updatedAt: nowTs,
     }
 
-    // Gỡ email/MSSV/họ tên của tài khoản mới tạo khỏi blacklist nếu người này từng bị xóa tài khoản trước đó
-    // (Vẫn giữ nguyên ID tài khoản cũ acc-... trong tombstone để khóa phiên cũ)
-    const unblockIdentities: string[] = [cleanEmail]
-    if (cleanStudentId) unblockIdentities.push(cleanStudentId)
+    // Gỡ ID/email/MSSV/họ tên của tài khoản mới tạo khỏi blacklist nếu người này từng bị xóa tài khoản trước đó
+    const unblockIdentities: string[] = [newAcc.id, cleanEmail]
+    if (cleanStudentId && cleanStudentId.toUpperCase() !== 'STAFF-001') unblockIdentities.push(cleanStudentId)
     if (cleanName) unblockIdentities.push(cleanName)
     const unblockLower = new Set(unblockIdentities.map((v) => v.toLowerCase().trim()))
 
@@ -820,53 +1093,141 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
     const updatedDelArr = Array.from(deletedAccountIdsRef.current)
-    lastLocalAccountMutationAtRef.current = Date.now()
+    lastLocalAccountMutationAtRef.current = nowTs
     try {
       localStorage.setItem('issac_deleted_account_ids', JSON.stringify(updatedDelArr))
     } catch {}
 
-    const updated = [newAcc, ...currentList]
-    issuedAccountsRef.current = updated
-    setIssuedAccounts(updated)
-    try {
-      localStorage.setItem('issac_issued_accounts', JSON.stringify(updated))
-    } catch (e) {
-      console.error(e)
-    }
+    // Ghi nhận vào hàng đợi local chưa đồng bộ để chống mất sau 2.5s hoặc khi F5
+    unsyncedLocalAccountsRef.current.set(newAcc.id, { account: newAcc, savedAt: nowTs })
+    persistUnsyncedAccountRecords(unsyncedLocalAccountsRef.current)
 
-    syncAccountsToCloud({
+    const updated = [newAcc, ...currentList.filter((a) => a.id !== newAcc.id)]
+    commitIssuedAccounts(updated)
+
+    const syncPromise = syncAccountsToCloud({
       action: 'create_account',
+      account: newAcc,
       accounts: updated,
       unblockAccountIdentities: unblockIdentities,
-      deletedAccountIds: updatedDelArr,
     })
 
-    return { success: true, message: `Cấp tài khoản thành công cho cán bộ "${cleanName}"!` }
+    return {
+      success: true,
+      message: `Cấp tài khoản thành công cho "${cleanName}"!`,
+      account: newAcc,
+      syncPromise,
+    }
   }
 
-  const updateIssuedAccount = (id: string, updates: Partial<IssuedAccount>) => {
+  const updateIssuedAccount = (id: string, updates: Partial<IssuedAccount>): AccountMutationResult => {
     // Chỉ Ban Chủ nhiệm mới có thể sửa tài khoản
     if (!canUserManageAccounts(currentUser)) {
       return { success: false, message: 'Chỉ Ban Chủ nhiệm mới có quyền chỉnh sửa tài khoản cán bộ!' }
     }
 
     const currentList = issuedAccountsRef.current.length > 0 ? issuedAccountsRef.current : issuedAccounts
-    const updated = currentList.map((a) => (a.id === id ? { ...a, ...updates } : a))
-    lastLocalAccountMutationAtRef.current = Date.now()
-    issuedAccountsRef.current = updated
-    setIssuedAccounts(updated)
-    try {
-      localStorage.setItem('issac_issued_accounts', JSON.stringify(updated))
-    } catch (e) {
-      console.error(e)
+    const existing = currentList.find((a) => a.id === id)
+    if (!existing) {
+      return { success: false, message: 'Không tìm thấy tài khoản cần cập nhật.' }
     }
 
-    syncAccountsToCloud({ action: 'update_account', accounts: updated })
+    const nextName = updates.fullName !== undefined ? updates.fullName.trim() : existing.fullName
+    const nextEmail = updates.email !== undefined ? updates.email.trim().toLowerCase() : existing.email.trim().toLowerCase()
+    const nextStudentId =
+      updates.studentId !== undefined ? updates.studentId.trim() || undefined : existing.studentId
+    const nextPassword =
+      updates.passwordPlain !== undefined ? updates.passwordPlain.trim() : existing.passwordPlain
 
-    return { success: true, message: 'Cập nhật tài khoản thành công!' }
+    if (!nextName || !nextEmail || !nextPassword) {
+      return { success: false, message: 'Họ tên, Email và Mật khẩu không được để trống!' }
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextEmail)) {
+      return { success: false, message: 'Định dạng Email đăng nhập chưa hợp lệ.' }
+    }
+
+    const dupEmail = currentList.find((a) => a.id !== id && a.email.trim().toLowerCase() === nextEmail)
+    if (dupEmail) {
+      return {
+        success: false,
+        message: `Email "${nextEmail}" đã được sử dụng bởi tài khoản "${dupEmail.fullName}".`,
+      }
+    }
+
+    if (nextStudentId && nextStudentId.toUpperCase() !== 'STAFF-001' && !existing.isFixed) {
+      const dupStudent = currentList.find(
+        (a) =>
+          a.id !== id &&
+          !a.isFixed &&
+          a.studentId &&
+          a.studentId.trim().toLowerCase() === nextStudentId.toLowerCase()
+      )
+      if (dupStudent) {
+        return {
+          success: false,
+          message: `Mã sinh viên "${nextStudentId}" đã gắn với tài khoản "${dupStudent.fullName}".`,
+        }
+      }
+    }
+
+    const nowTs = Date.now()
+    const nextDeptCode = updates.departmentCode || existing.departmentCode
+    const updatedTarget: IssuedAccount = {
+      ...existing,
+      ...updates,
+      departmentCode: nextDeptCode,
+      departmentSlug: updates.departmentSlug || DEPT_SLUG_BY_CODE[nextDeptCode] || existing.departmentSlug,
+      fullName: nextName,
+      email: nextEmail,
+      studentId: nextStudentId,
+      passwordPlain: nextPassword,
+      roleTitle: (updates.roleTitle !== undefined ? updates.roleTitle : existing.roleTitle).trim(),
+      updatedAt: nowTs,
+    }
+
+    const unblockIdentities = [updatedTarget.id, nextEmail, nextStudentId || '', nextName].filter(Boolean)
+    const unblockLower = new Set(unblockIdentities.map((v) => v.toLowerCase().trim()))
+    for (const delItem of Array.from(deletedAccountIdsRef.current)) {
+      if (unblockLower.has(delItem.toLowerCase().trim())) {
+        deletedAccountIdsRef.current.delete(delItem)
+      }
+    }
+    try {
+      localStorage.setItem('issac_deleted_account_ids', JSON.stringify(Array.from(deletedAccountIdsRef.current)))
+    } catch {}
+
+    lastLocalAccountMutationAtRef.current = nowTs
+    unsyncedLocalAccountsRef.current.set(id, { account: updatedTarget, savedAt: nowTs })
+    persistUnsyncedAccountRecords(unsyncedLocalAccountsRef.current)
+
+    const updated = currentList.map((a) => (a.id === id ? updatedTarget : a))
+    commitIssuedAccounts(updated)
+
+    // Cập nhật ngay phiên hiện tại nếu đang sửa tài khoản đang đăng nhập
+    if (currentUser && (currentUser.id === id || (!existing.isFixed && nextStudentId && currentUser.memberCode === nextStudentId))) {
+      if (updatedTarget.status === 'suspended') {
+        logout()
+      } else {
+        setCurrentUser(resolveAuthUserSession({ issued: updatedTarget }))
+      }
+    }
+
+    const syncPromise = syncAccountsToCloud({
+      action: 'update_account',
+      account: updatedTarget,
+      accounts: updated,
+      unblockAccountIdentities: unblockIdentities,
+    })
+
+    return {
+      success: true,
+      message: 'Cập nhật tài khoản thành công!',
+      account: updatedTarget,
+      syncPromise,
+    }
   }
 
-  const deleteIssuedAccount = (id: string) => {
+  const deleteIssuedAccount = (id: string): AccountMutationResult => {
     // Chỉ Ban Chủ nhiệm mới có thể xóa tài khoản
     if (!canUserManageAccounts(currentUser)) {
       return { success: false, message: 'Chỉ Ban Chủ nhiệm mới có quyền xóa tài khoản cán bộ!' }
@@ -879,10 +1240,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return { success: false, message: 'Không thể xóa tài khoản cố định của Ban Chủ nhiệm!' }
     }
 
+    if (unsyncedLocalAccountsRef.current.has(id)) {
+      unsyncedLocalAccountsRef.current.delete(id)
+      persistUnsyncedAccountRecords(unsyncedLocalAccountsRef.current)
+    }
+
     // 1. Lưu tombstone cho ID, MSSV và Email của tài khoản bị xóa (không khóa theo Họ tên chung để tránh ảnh hưởng người trùng tên)
     deletedAccountIdsRef.current.add(id)
     deletedAccountIdsRef.current.add(id.toLowerCase())
-    if (target?.studentId) {
+    if (target?.studentId && target.studentId.toUpperCase() !== 'STAFF-001') {
       deletedAccountIdsRef.current.add(target.studentId)
       deletedAccountIdsRef.current.add(target.studentId.toLowerCase())
     }
@@ -895,31 +1261,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     lastLocalAccountMutationAtRef.current = Date.now()
     try {
       localStorage.setItem('issac_deleted_account_ids', JSON.stringify(deletedArr))
-    } catch (e) {}
+    } catch {}
 
     // 2. Lọc bỏ tài khoản khỏi danh sách
-    const updated = currentList.filter((a) => !isEntityDeleted(a))
-    issuedAccountsRef.current = updated
-    setIssuedAccounts(updated)
-    try {
-      localStorage.setItem('issac_issued_accounts', JSON.stringify(updated))
-    } catch (e) {
-      console.error(e)
-    }
+    const updated = currentList.filter((a) => a.id !== id && !isEntityDeleted(a))
+    commitIssuedAccounts(updated)
 
     // 3. Nếu người dùng hiện tại bị xóa -> Đăng xuất ngay lập tức
     if (currentUser && isEntityDeleted(currentUser)) {
       setCurrentUser(null)
       try {
         localStorage.removeItem('issac_active_user')
-      } catch (e) {}
+      } catch {}
       if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
         window.location.href = '/login?reason=deleted'
       }
     }
 
     // 4. Đồng bộ lập tức lên Cloud Supabase để Điện thoại và Laptop nhận ngay xóa bỏ trong thời gian thực
-    syncAccountsToCloud({
+    const syncPromise = syncAccountsToCloud({
       accounts: updated,
       deletedAccountIds: deletedArr,
       action: 'delete_account',
@@ -928,7 +1288,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       email: target?.email,
     })
 
-    return { success: true, message: 'Đã xóa tài khoản thành công!' }
+    return { success: true, message: 'Đã xóa tài khoản thành công!', syncPromise }
   }
 
   const login = (accountInput: string, passwordInput?: string) => {
@@ -943,7 +1303,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const cleanPass = passwordInput.trim()
 
     // BƯỚC 1: KIỂM TRA BLACKLIST / TOMBSTONE TRƯỚC TIÊN
-    // Nếu tài khoản, MSSV, Email hoặc Họ tên đã bị Ban Chủ nhiệm xóa -> Chặn ngay lập tức
     if (isIdentityDeleted(clean)) {
       return {
         success: false,
@@ -961,29 +1320,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         m.full_name.toLowerCase() === clean
     )
 
-    // 2. Tìm kiếm trong danh sách tài khoản được cấp (issuedAccounts) - ưu tiên khớp email trực tiếp & tài khoản cá nhân trước acc-master
+    // 2. Tìm kiếm trong danh sách tài khoản được cấp (issuedAccounts):
+    //    Ưu tiên email/id khớp trực tiếp, sau đó MSSV cá nhân (tránh nhầm acc-master dùng STAFF-001 với thành viên STAFF-001)
     const currentIssuedList = issuedAccountsRef.current.length > 0 ? issuedAccountsRef.current : issuedAccounts
     const activeIssued = currentIssuedList.filter((a) => !isEntityDeleted(a))
+    const memberStudentClean = member?.student_id?.trim().toLowerCase()
+    const memberCodeClean = member?.member_code?.trim().toLowerCase()
     const issued =
-      activeIssued.find((a) => a.email.toLowerCase() === clean) ||
+      activeIssued.find((a) => a.email.toLowerCase() === clean || a.id.toLowerCase() === clean) ||
       activeIssued.find(
         (a) =>
           !a.isFixed &&
           ((a.studentId && a.studentId.toLowerCase() === clean) ||
             (member &&
               a.studentId &&
-              (a.studentId.toLowerCase() === member.student_id?.toLowerCase() ||
-                a.studentId.toLowerCase() === member.member_code.toLowerCase())) ||
+              a.studentId.toUpperCase() !== 'STAFF-001' &&
+              (a.studentId.toLowerCase() === memberStudentClean ||
+                a.studentId.toLowerCase() === memberCodeClean)) ||
             (member && a.email && a.email.toLowerCase() === member.email.toLowerCase()) ||
             a.fullName.toLowerCase() === clean)
       ) ||
       activeIssued.find(
         (a) =>
-          (a.studentId && a.studentId.toLowerCase() === clean) ||
+          (a.studentId && a.studentId.toUpperCase() !== 'STAFF-001' && a.studentId.toLowerCase() === clean) ||
           (member &&
             a.studentId &&
-            (a.studentId.toLowerCase() === member.student_id?.toLowerCase() ||
-              a.studentId.toLowerCase() === member.member_code.toLowerCase())) ||
+            a.studentId.toUpperCase() !== 'STAFF-001' &&
+            (a.studentId.toLowerCase() === memberStudentClean ||
+              a.studentId.toLowerCase() === memberCodeClean)) ||
           (member && a.email && a.email.toLowerCase() === member.email.toLowerCase()) ||
           a.fullName.toLowerCase() === clean
       )
@@ -998,7 +1362,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           u.name.toLowerCase() === clean)
     )
 
-    // BƯỚC 2: KIỂM TRA THỰC THỂ TÌM THẤY CÓ BỊ XÓA KHÔNG
+    // BƯỚC 2: KIỂM TRA THỰC THỂ TÌM THẤY CÓ BỊ XÓA HOẶC KHÓA KHÔNG
     if (
       (issued && isEntityDeleted(issued)) ||
       (member && isEntityDeleted(member)) ||
@@ -1033,6 +1397,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     if (issued?.passwordPlain) {
       validPasswords.add(issued.passwordPlain)
+      validPasswords.add(issued.passwordPlain.trim())
     }
     if (issued?.studentId) {
       validPasswords.add(issued.studentId)
@@ -1059,61 +1424,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    // Chuẩn hóa phân quyền tuyệt đối chính xác
-    let finalRole: UserRole = 'member'
-    let finalRoleTitle = ''
-    let isCore = false
-
-    if (member) {
-      const derived = getRoleForMember(member)
-      finalRole = derived.role
-      isCore = derived.isCore
-      finalRoleTitle = derived.roleTitle
-    } else if (issued) {
-      finalRole = issued.role
-      finalRoleTitle = issued.roleTitle
-      isCore = issued.role === 'bcn' || issued.role === 'hr' || issued.role === 'dept_head'
-      if (
-        issued.departmentSlug === 'nhan-su' &&
-        (issued.roleTitle.includes('Trưởng') || issued.roleTitle.includes('Phó'))
-      ) {
-        finalRole = 'hr'
-        isCore = true
-      }
-    } else if (preset) {
-      finalRole = preset.role
-      finalRoleTitle = preset.roleTitle
-      isCore = preset.isCore
-    }
-
-    const authUser: AuthUser = {
-      id: issued?.id || member?.member_code || preset?.id || `user-${Date.now()}`,
-      name: member?.full_name || issued?.fullName || preset?.name || 'Thành viên iSSAC',
-      role: finalRole,
-      roleTitle:
-        finalRoleTitle ||
-        (issued?.roleTitle ??
-          `${member?.position || 'Thành viên'} - ${member?.department_name || 'CLB iSSAC'}`),
-      departmentCode:
-        member?.department_code || issued?.departmentCode || preset?.departmentCode,
-      departmentName:
-        member?.department_name || issued?.departmentName || preset?.departmentName,
-      memberCode: member?.member_code || issued?.studentId || preset?.memberCode,
-      isCore,
-      avatarBg: 'bg-blue-600',
-      avatarUrl: member?.avatar_url || issued?.avatarUrl || preset?.avatarUrl,
-    }
+    const authUser = resolveAuthUserSession({ issued, member, preset })
 
     setCurrentUser(authUser)
     try {
       localStorage.setItem('issac_active_user', authUser.id)
-    } catch (e) {}
+    } catch {}
 
     return {
       success: true,
       user: authUser,
       message: `Đăng nhập thành công! Chào mừng ${authUser.name} (${authUser.roleTitle}).`,
     }
+  }
+
+  const loginWithSync = async (accountInput: string, passwordInput?: string) => {
+    // Đồng bộ danh sách tài khoản mới nhất từ Cloud trước khi xác thực để tài khoản vừa tạo ở thiết bị khác đăng nhập được ngay
+    await fetchCloudAccounts()
+    return login(accountInput, passwordInput)
   }
 
   const logout = () => {
@@ -1133,7 +1461,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       !currentUser?.roleTitle?.includes('Thành viên')) ||
     false
   const isDeptHead = currentUser?.role === 'dept_head' || false
-  const isMember = currentUser?.role === 'member' || currentUser?.roleTitle?.includes('Thành viên') || false
+  const hasLeadershipRole =
+    currentUser?.role === 'bcn' ||
+    currentUser?.role === 'admin' ||
+    currentUser?.role === 'hr' ||
+    currentUser?.role === 'dept_head'
+  const isMember =
+    currentUser?.role === 'member' ||
+    (!hasLeadershipRole && Boolean(currentUser?.roleTitle?.includes('Thành viên'))) ||
+    false
   const isCoreTeam = isUserCoreTeam(currentUser)
   const canManageAccounts = canUserManageAccounts(currentUser)
   const canAddOrProposeScore = Boolean(canUserAddOrProposeScore(currentUser))
@@ -1162,11 +1498,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isAuthenticated,
         switchUser,
         login,
+        loginWithSync,
         logout,
         issuedAccounts,
         createIssuedAccount,
         updateIssuedAccount,
         deleteIssuedAccount,
+        refreshCloudAccounts: fetchCloudAccounts,
+        cloudSyncError,
         isBCN,
         isHR,
         isDeptHead,

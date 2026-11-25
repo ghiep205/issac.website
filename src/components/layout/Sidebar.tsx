@@ -232,7 +232,7 @@ export function Sidebar({
       id: 'stats',
       label: t('nav.leaderboard'),
       icon: Trophy,
-      badge: `TOP ${members.length || 48}`,
+      badge: `TOP ${members.length}`,
       badgeType: 'pill',
     },
     {

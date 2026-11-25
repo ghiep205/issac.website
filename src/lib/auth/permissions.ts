@@ -20,8 +20,18 @@ export function isUserCoreTeam(
 ): boolean {
   if (!user) return false
 
-  // 1. Thành viên thường (role: 'member' hoặc chức danh bắt đầu bằng "Thành viên"):
-  // TUYỆT ĐỐI không thuộc Core Team, TRỪ KHI được phân định chính thức là is_core === true trong danh sách CLB
+  // 1. Ban Chủ nhiệm luôn thuộc Core Team
+  if (user.role === 'bcn' || user.role === 'admin' || (user.departmentCode === 'B04' && user.role !== 'member')) {
+    return true
+  }
+
+  // 2. Trưởng ban / Phó ban (dept_head) hoặc Trưởng/Phó ban Nhân sự (hr)
+  if (user.role === 'dept_head' || user.role === 'hr') {
+    return true
+  }
+
+  // 3. Thành viên thường (role: 'member' hoặc chức danh bắt đầu bằng "Thành viên" khi không có role quản lý):
+  // Chỉ thuộc Core Team nếu được phân định chính thức is_core === true trong danh sách CLB
   const isRegularMember =
     user.role === 'member' ||
     Boolean(user.roleTitle && user.roleTitle.toLowerCase().startsWith('thành viên'))
@@ -37,16 +47,6 @@ export function isUserCoreTeam(
       return Boolean(found?.is_core)
     }
     return false
-  }
-
-  // 2. Ban Chủ nhiệm luôn thuộc Core Team
-  if (user.role === 'bcn' || user.role === 'admin' || user.departmentCode === 'B04') {
-    return true
-  }
-
-  // 3. Trưởng ban / Phó ban (dept_head) hoặc Trưởng/Phó ban Nhân sự (hr)
-  if (user.role === 'dept_head' || user.role === 'hr') {
-    return true
   }
 
   // 4. Nếu chức vụ chứa Trưởng ban / Phó ban / Chủ nhiệm

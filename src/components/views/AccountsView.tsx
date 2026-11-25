@@ -21,6 +21,7 @@ import {
   Search,
   KeyRound,
   Users,
+  RefreshCw,
 } from 'lucide-react'
 
 export function AccountsView() {
@@ -30,6 +31,8 @@ export function AccountsView() {
     createIssuedAccount,
     updateIssuedAccount,
     deleteIssuedAccount,
+    refreshCloudAccounts,
+    cloudSyncError,
     isBCN,
     canManageAccounts,
   } = useAuth()
@@ -84,6 +87,9 @@ export function AccountsView() {
     message: string
     existingAccount?: IssuedAccount
   } | null>(null)
+  const [isCreatingAccount, setIsCreatingAccount] = useState(false)
+  const [isSavingEdit, setIsSavingEdit] = useState(false)
+  const [isSyncingCloud, setIsSyncingCloud] = useState(false)
 
   // Modal Sửa thông tin / Đổi mật khẩu
   const [editingAccount, setEditingAccount] = useState<IssuedAccount | null>(null)
@@ -112,6 +118,65 @@ export function AccountsView() {
     )
   }
 
+  const deptNamesByCode: Record<DepartmentCode, string> = {
+    B04: 'Ban Chủ nhiệm',
+    B01: 'Ban Truyền thông',
+    B02: 'Ban Tư vấn',
+    B03: 'Ban Nhân sự',
+  }
+
+  const buildDefaultRoleTitle = (deptCode: DepartmentCode, role: UserRole): string => {
+    const deptName = deptNamesByCode[deptCode] || 'CLB iSSAC'
+    if (role === 'bcn') return deptCode === 'B04' ? 'Phó Chủ nhiệm CLB iSSAC' : `Phụ trách - ${deptName}`
+    if (role === 'hr') return `Cán bộ ${deptName} (HR)`
+    if (role === 'dept_head') return `Trưởng / Phó ${deptName}`
+    return `Thành viên - ${deptName}`
+  }
+
+  const isDefaultGeneratedTitle = (title: string): boolean => {
+    const t = title.trim()
+    if (!t) return true
+    const codes: DepartmentCode[] = ['B01', 'B02', 'B03', 'B04']
+    const roles: UserRole[] = ['member', 'dept_head', 'hr', 'bcn']
+    for (const c of codes) {
+      for (const r of roles) {
+        if (t === buildDefaultRoleTitle(c, r) || t === `Thành viên ${deptNamesByCode[c]}`) return true
+      }
+    }
+    return false
+  }
+
+  const findMatchedMemberForAccount = (account: IssuedAccount) => {
+    const cleanStudent = account.studentId?.trim().toLowerCase()
+    const cleanEmail = account.email?.trim().toLowerCase()
+    if (cleanStudent && cleanStudent !== 'staff-001') {
+      const byCode = members.find(
+        (m) =>
+          (m.student_id && m.student_id.trim().toLowerCase() === cleanStudent) ||
+          m.member_code.trim().toLowerCase() === cleanStudent
+      )
+      if (byCode) return byCode
+    }
+    if (cleanEmail) {
+      const byEmail = members.find((m) => m.email && m.email.trim().toLowerCase() === cleanEmail)
+      if (byEmail) return byEmail
+    }
+    if (!account.isFixed && (!cleanStudent || cleanStudent === 'staff-001')) {
+      const cleanName = account.fullName.trim().toLowerCase()
+      return members.find((m) => m.full_name.trim().toLowerCase() === cleanName)
+    }
+    return undefined
+  }
+
+  const handleManualSync = async () => {
+    setIsSyncingCloud(true)
+    try {
+      await refreshCloudAccounts()
+    } finally {
+      setTimeout(() => setIsSyncingCloud(false), 300)
+    }
+  }
+
   const openAddModalClean = () => {
     setSelectedMemberCode('')
     setNewFullName('')
@@ -119,7 +184,7 @@ export function AccountsView() {
     setNewStudentId('')
     setNewDeptCode('B01')
     setNewRole('member')
-    setNewRoleTitle('Thành viên Ban Truyền thông')
+    setNewRoleTitle(buildDefaultRoleTitle('B01', 'member'))
     setNewPassword('ISSAC2026@clb')
     setAddFeedback(null)
     setIsAddModalOpen(true)
@@ -208,8 +273,9 @@ export function AccountsView() {
     setNewPassword(pass)
   }
 
-  const handleCreateSubmit = (e: React.FormEvent) => {
+  const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (isCreatingAccount) return
     const cleanName = newFullName.trim()
     const cleanEmail = newEmail.trim().toLowerCase()
     const cleanPassword = newPassword.trim()
@@ -241,6 +307,7 @@ export function AccountsView() {
 
     const deptInfo = deptMap[newDeptCode] || deptMap.B01
 
+    setIsCreatingAccount(true)
     const res = createIssuedAccount({
       fullName: cleanName,
       email: cleanEmail,
@@ -249,13 +316,21 @@ export function AccountsView() {
       departmentName: deptInfo.name,
       departmentSlug: deptInfo.slug,
       role: newRole,
-      roleTitle: newRoleTitle.trim() || `${deptInfo.name}`,
+      roleTitle: newRoleTitle.trim() || buildDefaultRoleTitle(newDeptCode, newRole),
       passwordPlain: cleanPassword,
       status: 'active',
     })
 
     if (res.success) {
-      setAddFeedback({ type: 'success', message: res.message })
+      const cloudOk = res.syncPromise ? await res.syncPromise : false
+      setIsCreatingAccount(false)
+      setSearchQuery('')
+      setAddFeedback({
+        type: 'success',
+        message: cloudOk
+          ? `${res.message} Đã đồng bộ lên Cloud để đăng nhập ngay trên mọi thiết bị.`
+          : `${res.message} (Đã lưu trên máy này; hệ thống sẽ tự đẩy lại lên Cloud khi kết nối Supabase ổn định).`,
+      })
       scrollAddModalToTop()
       setTimeout(() => {
         setIsAddModalOpen(false)
@@ -264,8 +339,9 @@ export function AccountsView() {
         setNewFullName('')
         setNewEmail('')
         setNewStudentId('')
-      }, 1000)
+      }, cloudOk ? 850 : 1600)
     } else {
+      setIsCreatingAccount(false)
       const existing = issuedAccounts.find(
         (a) =>
           a.email.trim().toLowerCase() === cleanEmail ||
@@ -283,9 +359,9 @@ export function AccountsView() {
     }
   }
 
-  const handleEditSubmit = (e: React.FormEvent) => {
+  const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!editingAccount) return
+    if (!editingAccount || isSavingEdit) return
 
     const deptMap: Record<DepartmentCode, { name: string; slug: DepartmentSlug }> = {
       B04: { name: 'Ban Chủ nhiệm', slug: 'bcn' },
@@ -307,14 +383,23 @@ export function AccountsView() {
       updates.passwordPlain = editPassword.trim()
     }
 
+    setIsSavingEdit(true)
     const res = updateIssuedAccount(editingAccount.id, updates)
     if (res.success) {
-      setEditFeedback({ type: 'success', message: res.message })
+      const cloudOk = res.syncPromise ? await res.syncPromise : false
+      setIsSavingEdit(false)
+      setEditFeedback({
+        type: 'success',
+        message: cloudOk
+          ? `${res.message} Đã đồng bộ lên Cloud.`
+          : `${res.message} (Đã lưu trên máy này; đang chờ đồng bộ Cloud).`,
+      })
       setTimeout(() => {
         setEditingAccount(null)
         setEditFeedback(null)
-      }, 900)
+      }, cloudOk ? 850 : 1500)
     } else {
+      setIsSavingEdit(false)
       setEditFeedback({ type: 'error', message: res.message })
     }
   }
@@ -434,14 +519,25 @@ export function AccountsView() {
         </div>
 
         {canManageAccounts ? (
-          <button
-            type="button"
-            onClick={openAddModalClean}
-            className="px-4 py-2.5 rounded-xl bg-[#0284C7] hover:bg-[#0369A1] text-white font-bold text-xs sm:text-[13px] transition shadow-xs hover:shadow flex items-center gap-2 active:scale-95 cursor-pointer shrink-0 self-start md:self-center"
-          >
-            <Plus className="w-4 h-4 stroke-[2.5]" />
-            <span>{language === 'vi' ? 'Cấp tài khoản mới' : 'Issue New Account'}</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0 self-start md:self-center">
+            <button
+              type="button"
+              onClick={handleManualSync}
+              disabled={isSyncingCloud}
+              className="px-3.5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingCloud ? 'animate-spin' : ''}`} />
+              <span>{language === 'vi' ? 'Đồng bộ Cloud' : 'Sync Cloud'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={openAddModalClean}
+              className="px-4 py-2.5 rounded-xl bg-[#0284C7] hover:bg-[#0369A1] text-white font-bold text-xs sm:text-[13px] transition shadow-xs hover:shadow flex items-center gap-2 active:scale-95 cursor-pointer"
+            >
+              <Plus className="w-4 h-4 stroke-[2.5]" />
+              <span>{language === 'vi' ? 'Cấp tài khoản mới' : 'Issue New Account'}</span>
+            </button>
+          </div>
         ) : (
           <div className="px-4 py-2 rounded-xl text-xs font-bold text-amber-800 bg-amber-50 border border-amber-200/90 flex items-center gap-2 shrink-0 shadow-2xs self-start md:self-center">
             <Lock className="w-3.5 h-3.5 text-amber-600" />
@@ -449,6 +545,18 @@ export function AccountsView() {
           </div>
         )}
       </div>
+
+      {cloudSyncError && (
+        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-semibold flex items-start gap-2.5 shadow-2xs">
+          <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <p className="font-bold">
+              {language === 'vi' ? 'Cảnh báo lưu trữ Cloud Supabase:' : 'Cloud Sync Notice:'}
+            </p>
+            <p className="text-amber-800 leading-relaxed">{cloudSyncError}</p>
+          </div>
+        </div>
+      )}
 
       {/* 2. MAIN TABLE CARD: DANH SÁCH TÀI KHOẢN CÁN BỘ */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
@@ -488,8 +596,8 @@ export function AccountsView() {
         <div className="block md:hidden p-3 space-y-3">
           {filteredAccounts.map((account) => {
             const isPasswordRevealed = revealedPasswords[account.id] || false
-            const memberObj = members.find((m) => (account.studentId && (m.student_id === account.studentId || m.member_code === account.studentId)) || m.full_name === account.fullName || m.email === account.email)
-            const avatarUrl = account.avatarUrl || getMemberAvatarUrl(memberObj || { full_name: account.fullName, email: account.email, member_code: account.studentId })
+            const memberObj = findMatchedMemberForAccount(account)
+            const avatarUrl = account.avatarUrl || (memberObj ? getMemberAvatarUrl(memberObj) : null)
 
             return (
               <div
@@ -516,7 +624,10 @@ export function AccountsView() {
                           </span>
                         )}
                       </div>
-                      <p className="text-[11px] text-slate-500 font-mono truncate">{account.email}</p>
+                      <p className="text-[11px] text-slate-500 font-mono truncate">
+                        {account.email}
+                        {account.studentId && account.studentId !== 'STAFF-001' ? ` · MSSV: ${account.studentId}` : ''}
+                      </p>
                     </div>
                   </div>
 
@@ -586,8 +697,8 @@ export function AccountsView() {
             <tbody className="divide-y divide-slate-100">
               {filteredAccounts.map((account) => {
                 const isPasswordRevealed = revealedPasswords[account.id] || false
-                const memberObj = members.find((m) => (account.studentId && (m.student_id === account.studentId || m.member_code === account.studentId)) || m.full_name === account.fullName || m.email === account.email)
-                const avatarUrl = account.avatarUrl || getMemberAvatarUrl(memberObj || { full_name: account.fullName, email: account.email, member_code: account.studentId })
+                const memberObj = findMatchedMemberForAccount(account)
+                const avatarUrl = account.avatarUrl || (memberObj ? getMemberAvatarUrl(memberObj) : null)
 
                 return (
                   <tr
@@ -620,6 +731,7 @@ export function AccountsView() {
                           </div>
                           <p className="text-[11px] text-slate-400 font-mono">
                             {account.email}
+                            {account.studentId && account.studentId !== 'STAFF-001' ? ` · MSSV: ${account.studentId}` : ''}
                           </p>
                         </div>
                       </div>
@@ -860,7 +972,13 @@ export function AccountsView() {
                   <label className="block font-bold text-slate-700">{language === 'vi' ? 'Ban được phân công:' : 'Assigned Department:'}</label>
                   <select
                     value={newDeptCode}
-                    onChange={(e) => setNewDeptCode(e.target.value as DepartmentCode)}
+                    onChange={(e) => {
+                      const nextDept = e.target.value as DepartmentCode
+                      setNewDeptCode(nextDept)
+                      if (isDefaultGeneratedTitle(newRoleTitle)) {
+                        setNewRoleTitle(buildDefaultRoleTitle(nextDept, newRole))
+                      }
+                    }}
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:border-[#0284C7] shadow-2xs"
                   >
                     <option value="B04">{language === 'vi' ? 'Ban Chủ nhiệm' : 'Executive Board'}</option>
@@ -874,7 +992,13 @@ export function AccountsView() {
                   <label className="block font-bold text-slate-700">{language === 'vi' ? 'Phân quyền vai trò:' : 'Role Permission:'}</label>
                   <select
                     value={newRole}
-                    onChange={(e) => setNewRole(e.target.value as UserRole)}
+                    onChange={(e) => {
+                      const nextR = e.target.value as UserRole
+                      setNewRole(nextR)
+                      if (isDefaultGeneratedTitle(newRoleTitle)) {
+                        setNewRoleTitle(buildDefaultRoleTitle(newDeptCode, nextR))
+                      }
+                    }}
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:border-[#0284C7] shadow-2xs"
                   >
                     <option value="member">{language === 'vi' ? 'Thành viên' : 'Member'}</option>
@@ -952,10 +1076,19 @@ export function AccountsView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl text-xs font-bold text-white bg-[#0284C7] hover:bg-[#0369A1] shadow-xs transition active:scale-95 cursor-pointer flex items-center gap-1.5"
+                  disabled={isCreatingAccount}
+                  className="px-5 py-2 rounded-xl text-xs font-bold text-white bg-[#0284C7] hover:bg-[#0369A1] shadow-xs transition active:scale-95 cursor-pointer flex items-center gap-1.5 disabled:opacity-60"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>{language === 'vi' ? 'Xác Nhận Cấp Tài Khoản' : 'Confirm Issue'}</span>
+                  <span>
+                    {isCreatingAccount
+                      ? language === 'vi'
+                        ? 'Đang cấp & đồng bộ...'
+                        : 'Issuing...'
+                      : language === 'vi'
+                        ? 'Xác Nhận Cấp Tài Khoản'
+                        : 'Confirm Issue'}
+                  </span>
                 </button>
               </div>
             </form>
@@ -993,7 +1126,11 @@ export function AccountsView() {
                     : 'bg-rose-50 text-rose-800 border border-rose-200'
                 }`}
               >
-                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                {editFeedback.type === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                )}
                 <span>{editFeedback.message}</span>
               </div>
             )}
@@ -1004,7 +1141,12 @@ export function AccountsView() {
                   {language === 'vi' ? 'Cán bộ' : 'Staff'}
                 </span>
                 <p className="font-bold text-[#061651] text-sm">{editingAccount.fullName}</p>
-                <p className="text-slate-500 font-mono text-[11px]">{editingAccount.email}</p>
+                <p className="text-slate-500 font-mono text-[11px]">
+                  {editingAccount.email}
+                  {editingAccount.studentId && editingAccount.studentId !== 'STAFF-001'
+                    ? ` · MSSV: ${editingAccount.studentId}`
+                    : ''}
+                </p>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -1014,7 +1156,13 @@ export function AccountsView() {
                   </label>
                   <select
                     value={editDeptCode}
-                    onChange={(e) => setEditDeptCode(e.target.value as DepartmentCode)}
+                    onChange={(e) => {
+                      const nextDept = e.target.value as DepartmentCode
+                      setEditDeptCode(nextDept)
+                      if (isDefaultGeneratedTitle(editRoleTitle)) {
+                        setEditRoleTitle(buildDefaultRoleTitle(nextDept, editRole))
+                      }
+                    }}
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:border-[#0284C7]"
                   >
                     <option value="B04">{language === 'vi' ? 'Ban Chủ nhiệm' : 'Executive Board'}</option>
@@ -1030,7 +1178,13 @@ export function AccountsView() {
                   </label>
                   <select
                     value={editRole}
-                    onChange={(e) => setEditRole(e.target.value as UserRole)}
+                    onChange={(e) => {
+                      const nextR = e.target.value as UserRole
+                      setEditRole(nextR)
+                      if (isDefaultGeneratedTitle(editRoleTitle)) {
+                        setEditRoleTitle(buildDefaultRoleTitle(editDeptCode, nextR))
+                      }
+                    }}
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:border-[#0284C7]"
                   >
                     <option value="member">{language === 'vi' ? 'Thành viên' : 'Member'}</option>
@@ -1090,10 +1244,19 @@ export function AccountsView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl text-xs font-bold text-white bg-[#0284C7] hover:bg-[#0369A1] transition shadow-xs cursor-pointer flex items-center gap-1.5"
+                  disabled={isSavingEdit}
+                  className="px-5 py-2 rounded-xl text-xs font-bold text-white bg-[#0284C7] hover:bg-[#0369A1] transition shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-60"
                 >
                   <Check className="w-3.5 h-3.5" />
-                  <span>{language === 'vi' ? 'Lưu Thay Đổi' : 'Save Changes'}</span>
+                  <span>
+                    {isSavingEdit
+                      ? language === 'vi'
+                        ? 'Đang lưu & đồng bộ...'
+                        : 'Saving...'
+                      : language === 'vi'
+                        ? 'Lưu Thay Đổi'
+                        : 'Save Changes'}
+                  </span>
                 </button>
               </div>
             </form>
