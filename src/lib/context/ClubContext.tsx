@@ -187,7 +187,6 @@ interface ClubContextType {
   ) => { success: boolean; message: string }
   currentActiveMonth: string
   resetMonthlyScores: (newMonthLabel: string, actorName: string) => { success: boolean; message: string }
-  restoreOctoberScores: () => void
   // Hệ thống chu kỳ tháng & khóa sổ thi đua
   periods: PeriodItem[]
   customPeriodScores: Record<string, Record<string, number>>
@@ -2476,12 +2475,6 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  // Khôi phục điểm demo Tháng 10
-  const restoreOctoberScores = () => {
-    setMembers(getActiveRosterMembers(INITIAL_MEMBERS))
-    setCurrentActiveMonth('Tháng 10/2025')
-  }
-
   // Tạo chu kỳ tháng thi đua mới theo thời gian thực (Quyền Ban Chủ nhiệm)
   const createMonthPeriod = (data: {
     month: number
@@ -3167,7 +3160,6 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         resolveDisputeByBCN,
         currentActiveMonth,
         resetMonthlyScores,
-        restoreOctoberScores,
         periods,
         customPeriodScores,
         currentActivePeriodId,

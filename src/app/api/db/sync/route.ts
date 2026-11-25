@@ -1413,9 +1413,6 @@ export async function POST(request: Request) {
         ...(cachedDeletedSurveyEventIds || []),
         ...incomingDelSurvey,
       ])
-      if (action === 'restore_survey_events') {
-        combinedDelSurveySet.clear()
-      }
       cachedDeletedSurveyEventIds = Array.from(combinedDelSurveySet)
 
       if (cachedSurveyEvents && Array.isArray(cachedSurveyEvents)) {

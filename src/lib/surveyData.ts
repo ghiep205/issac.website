@@ -417,26 +417,6 @@ export function deleteSurveyEvent(id: string): SurveyEventItem[] {
   }
 }
 
-export function restoreDefaultSurveyEvents(): SurveyEventItem[] {
-  if (typeof window === 'undefined') return INITIAL_SURVEY_EVENTS
-  try {
-    localStorage.removeItem(SURVEY_DELETED_EVENTS_STORAGE_KEY)
-    localStorage.setItem(SURVEY_EVENTS_STORAGE_KEY, JSON.stringify(INITIAL_SURVEY_EVENTS))
-
-    syncSurveyToCloud({
-      action: 'restore_survey_events',
-      surveyEvents: INITIAL_SURVEY_EVENTS,
-      deletedSurveyEventIds: [],
-    })
-
-    window.dispatchEvent(new Event('storage'))
-    return INITIAL_SURVEY_EVENTS
-  } catch (err) {
-    console.error('Failed to restore default survey events:', err)
-    return INITIAL_SURVEY_EVENTS
-  }
-}
-
 export function getStoredCustomQuestions(eventId: string): SurveyQuestionItem[] {
   if (typeof window === 'undefined') return DEFAULT_EVENT_CUSTOM_QUESTIONS
   try {

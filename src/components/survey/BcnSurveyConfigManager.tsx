@@ -9,7 +9,6 @@ import {
   Trash2,
   Edit3,
   Star,
-  Sparkles,
   ShieldCheck,
   Users,
   Award,
@@ -38,7 +37,6 @@ import {
   saveCustomQuestions,
   getStoredSurveyFeedbacks,
   isSurveyEventExpired,
-  restoreDefaultSurveyEvents,
 } from '@/lib/surveyData'
 
 interface BcnSurveyConfigManagerProps {
@@ -368,23 +366,6 @@ export function BcnSurveyConfigManager({
               </p>
             </div>
             <div className="pt-2 flex items-center justify-center gap-2.5 flex-wrap">
-              <button
-                type="button"
-                onClick={() => {
-                  const restored = restoreDefaultSurveyEvents()
-                  setEvents(restored)
-                  onEventsChange?.(restored)
-                  if (onSelectEvent && restored[0]) {
-                    onSelectEvent(restored[0].name)
-                  }
-                  showToast('Đã khôi phục thành công sự kiện Đánh giá Core Team T10!')
-                }}
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs sm:text-sm shadow-sm hover:shadow-md transition active:scale-95 cursor-pointer border-0"
-              >
-                <Sparkles className="w-4 h-4 stroke-[2]" />
-                <span>Khôi phục sự kiện T10</span>
-              </button>
-
               <button
                 type="button"
                 onClick={() => setShowCreateEventModal(true)}
