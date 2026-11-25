@@ -79,10 +79,26 @@ export function DashboardView({
     })
   })
 
-  // Thống kê thành viên theo Ban
-  const ttMembers = members.filter((m) => m.department_code === 'B01').length
-  const tvMembers = members.filter((m) => m.department_code === 'B02').length
-  const nsMembers = members.filter((m) => m.department_code === 'B03').length
+  // Thống kê thành viên theo Ban (tính động theo dữ liệu thực tế)
+  const ttList = members.filter((m) => m.department_code === 'B01')
+  const tvList = members.filter((m) => m.department_code === 'B02')
+  const nsList = members.filter((m) => m.department_code === 'B03')
+  const bcnList = members.filter((m) => m.department_code === 'B04')
+
+  const ttMembers = ttList.length
+  const tvMembers = tvList.length
+  const nsMembers = nsList.length
+  const bcnMembers = bcnList.length
+
+  const calcDeptStats = (list: typeof members) => {
+    const share = totalMembers > 0 ? ((list.length / totalMembers) * 100).toFixed(1) : '0.0'
+    const avg = list.length > 0 ? (list.reduce((s, m) => s + m.current_score, 0) / list.length).toFixed(1) : '60.0'
+    return { share, avg }
+  }
+  const tvStats = calcDeptStats(tvList)
+  const ttStats = calcDeptStats(ttList)
+  const nsStats = calcDeptStats(nsList)
+  const bcnStats = calcDeptStats(bcnList)
 
   // Top 5 thành viên dẫn đầu
   const top5Members = [...members].sort((a, b) => b.current_score - a.current_score).slice(0, 5)
@@ -597,11 +613,11 @@ export function DashboardView({
                 <div className="bg-slate-100 rounded-full h-2.5 overflow-hidden">
                   <div
                     className="bg-[#EC4899] h-full rounded-full"
-                    style={{ width: '47.9%' }}
+                    style={{ width: `${tvStats.share}%` }}
                   />
                 </div>
                 <span className="text-[10px] text-slate-500 font-medium block">
-                  47.9% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: 73.8{language === 'vi' ? 'đ' : ' pts'}
+                  {tvStats.share}% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: {tvStats.avg}{language === 'vi' ? 'đ' : ' pts'}
                 </span>
               </div>
 
@@ -614,11 +630,11 @@ export function DashboardView({
                 <div className="bg-slate-100 rounded-full h-2.5 overflow-hidden">
                   <div
                     className="bg-[#1351D8] h-full rounded-full"
-                    style={{ width: '29.2%' }}
+                    style={{ width: `${ttStats.share}%` }}
                   />
                 </div>
                 <span className="text-[10px] text-slate-500 font-medium block">
-                  29.2% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: 78.4{language === 'vi' ? 'đ' : ' pts'}
+                  {ttStats.share}% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: {ttStats.avg}{language === 'vi' ? 'đ' : ' pts'}
                 </span>
               </div>
 
@@ -631,11 +647,11 @@ export function DashboardView({
                 <div className="bg-slate-100 rounded-full h-2.5 overflow-hidden">
                   <div
                     className="bg-[#6366F1] h-full rounded-full"
-                    style={{ width: '16.7%' }}
+                    style={{ width: `${nsStats.share}%` }}
                   />
                 </div>
                 <span className="text-[10px] text-slate-500 font-medium block">
-                  16.7% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: 75.2{language === 'vi' ? 'đ' : ' pts'}
+                  {nsStats.share}% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: {nsStats.avg}{language === 'vi' ? 'đ' : ' pts'}
                 </span>
               </div>
 
@@ -643,16 +659,16 @@ export function DashboardView({
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-bold text-[#061651]">{t('dashboard.dept_bcn')}</span>
-                  <span className="font-black text-[#061651]">3 {t('dashboard.members_count')}</span>
+                  <span className="font-black text-[#061651]">{bcnMembers} {t('dashboard.members_count')}</span>
                 </div>
                 <div className="bg-slate-100 rounded-full h-2.5 overflow-hidden">
                   <div
                     className="bg-[#F59E0B] h-full rounded-full"
-                    style={{ width: '6.2%' }}
+                    style={{ width: `${bcnStats.share}%` }}
                   />
                 </div>
                 <span className="text-[10px] text-slate-500 font-medium block">
-                  6.2% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: 88.0{language === 'vi' ? 'đ' : ' pts'}
+                  {bcnStats.share}% {t('dashboard.club_share')}, {t('dashboard.avg_score_label')}: {bcnStats.avg}{language === 'vi' ? 'đ' : ' pts'}
                 </span>
               </div>
             </div>
@@ -667,7 +683,7 @@ export function DashboardView({
               className="rounded-xl border border-emerald-200/80 bg-[#F0FDF4] p-3 text-center hover:bg-emerald-100/50 transition hover:shadow-xs group cursor-pointer"
             >
               <span className="text-xl font-black text-[#059669] block group-hover:scale-105 transition-transform">
-                {members.filter((m) => m.current_score >= 80).length || 15}
+                {members.filter((m) => m.current_score >= 80).length}
               </span>
               <span className="text-[9px] font-bold text-[#047857] uppercase tracking-wider block mt-0.5">
                 {t('dashboard.box_top15')}
@@ -681,7 +697,7 @@ export function DashboardView({
               className="rounded-xl border border-amber-200/80 bg-[#FFFBEB] p-3 text-center hover:bg-amber-100/50 transition hover:shadow-xs group cursor-pointer"
             >
               <span className="text-xl font-black text-[#D97706] block group-hover:scale-105 transition-transform">
-                {members.filter((m) => m.current_score >= 60 && m.current_score < 80).length || 32}
+                {members.filter((m) => m.current_score >= 60 && m.current_score < 80).length}
               </span>
               <span className="text-[9px] font-bold text-[#B45309] uppercase tracking-wider block mt-0.5">
                 {t('dashboard.box_qualified')}
@@ -695,7 +711,7 @@ export function DashboardView({
               className="rounded-xl border border-slate-200/90 bg-slate-50 p-3 text-center hover:bg-slate-100 transition hover:shadow-xs group cursor-pointer"
             >
               <span className="text-xl font-black text-[#061651] block group-hover:scale-105 transition-transform">
-                {members.filter((m) => m.current_score < 60 || m.absent_count_t02 >= 1).length || 1}
+                {members.filter((m) => m.current_score < 60 || m.absent_count_t02 >= 1).length}
               </span>
               <span className="text-[9px] font-bold text-[#64748B] uppercase tracking-wider block mt-0.5">
                 {t('dashboard.box_warning')}

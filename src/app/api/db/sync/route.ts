@@ -22,11 +22,23 @@ let cachedAccounts: any[] | null = null
 let cachedDeletedAccountIds: string[] | null = null
 let cachedDeletedMemberCodes: string[] | null = null
 let cachedActivities: any[] | null = null
+let cachedDeletedActivityIds: string[] | null = null
 let cachedSchedulePendingRequests: any[] | null = null
 let cachedSurveyEvents: any[] | null = null
 let cachedSurveyFeedbacks: any[] | null = null
 let cachedDeletedSurveyEventIds: string[] | null = null
 let cachedSurveyCustomQuestions: Record<string, any> | null = null
+let cachedBcnSurveyNotes: Record<string, string> | null = null
+
+function isAccountDeletedBySet(acc: any, delSet: Set<string>): boolean {
+  if (!acc || delSet.size === 0) return false
+  const lowerDel = new Set<string>()
+  delSet.forEach((v) => {
+    if (v) lowerDel.add(String(v).toLowerCase().trim())
+  })
+  const candidates = [acc.id, acc.studentId, acc.memberCode, acc.email, acc.fullName]
+  return candidates.some((val) => val && lowerDel.has(String(val).toLowerCase().trim()))
+}
 
 async function loadSettingJson<T>(supabase: ReturnType<typeof createAdminClient>, key: string): Promise<T | null> {
   try {
@@ -70,11 +82,13 @@ export async function GET(request: Request) {
         'issac_deleted_account_ids',
         'issac_deleted_member_codes_v2',
         'issac_activities_cloud',
+        'issac_deleted_activity_ids',
         'issac_schedule_pending_requests',
         'issac_survey_events_cloud',
         'issac_survey_feedbacks_cloud',
         'issac_deleted_survey_event_ids',
         'issac_survey_custom_questions_cloud',
+        'issac_bcn_survey_notes_cloud',
       ])
 
     if (!error && data && data.length > 0) {
@@ -94,11 +108,13 @@ export async function GET(request: Request) {
       const deletedAccountsRow = data.find((r) => r.key === 'issac_deleted_account_ids')
       const deletedMemberCodesRow = data.find((r) => r.key === 'issac_deleted_member_codes_v2')
       const activitiesRow = data.find((r) => r.key === 'issac_activities_cloud')
+      const deletedActivityIdsRow = data.find((r) => r.key === 'issac_deleted_activity_ids')
       const schedulePendingRequestsRow = data.find((r) => r.key === 'issac_schedule_pending_requests')
       const surveyEventsRow = data.find((r) => r.key === 'issac_survey_events_cloud')
       const surveyFeedbacksRow = data.find((r) => r.key === 'issac_survey_feedbacks_cloud')
       const deletedSurveyEventIdsRow = data.find((r) => r.key === 'issac_deleted_survey_event_ids')
       const surveyCustomQuestionsRow = data.find((r) => r.key === 'issac_survey_custom_questions_cloud')
+      const bcnSurveyNotesRow = data.find((r) => r.key === 'issac_bcn_survey_notes_cloud')
 
       let eventsFromDb = null
       let proposalsFromDb = null
@@ -116,11 +132,13 @@ export async function GET(request: Request) {
       let deletedAccountIdsFromDb = null
       let deletedMemberCodesFromDb = null
       let activitiesFromDb = null
+      let deletedActivityIdsFromDb = null
       let schedulePendingRequestsFromDb = null
       let surveyEventsFromDb = null
       let surveyFeedbacksFromDb = null
       let deletedSurveyEventIdsFromDb = null
       let surveyCustomQuestionsFromDb = null
+      let bcnSurveyNotesFromDb = null
 
       if (eventsRow?.value) {
         try {
@@ -260,6 +278,24 @@ export async function GET(request: Request) {
         }
       }
 
+      if (deletedActivityIdsRow?.value) {
+        try {
+          deletedActivityIdsFromDb = JSON.parse(deletedActivityIdsRow.value)
+          cachedDeletedActivityIds = deletedActivityIdsFromDb
+        } catch (e) {
+          console.error('Error parsing deleted activity IDs JSON:', e)
+        }
+      }
+
+      if (bcnSurveyNotesRow?.value) {
+        try {
+          bcnSurveyNotesFromDb = JSON.parse(bcnSurveyNotesRow.value)
+          cachedBcnSurveyNotes = bcnSurveyNotesFromDb
+        } catch (e) {
+          console.error('Error parsing BCN survey notes JSON:', e)
+        }
+      }
+
       if (schedulePendingRequestsRow?.value) {
         try {
           schedulePendingRequestsFromDb = JSON.parse(schedulePendingRequestsRow.value)
@@ -341,18 +377,30 @@ export async function GET(request: Request) {
 
       const activeDeletedAccountIds = new Set<string>((deletedAccountIdsFromDb || cachedDeletedAccountIds || []) as string[])
       const activeDeletedMemberCodes = new Set<string>((deletedMemberCodesFromDb || cachedDeletedMemberCodes || []) as string[])
+      const activeDeletedActivityIds = new Set<string>((deletedActivityIdsFromDb || cachedDeletedActivityIds || []) as string[])
 
       let finalAccounts = accountsFromDb || cachedAccounts || INITIAL_ISSUED_ACCOUNTS
       if (Array.isArray(finalAccounts) && activeDeletedAccountIds.size > 0) {
-        finalAccounts = finalAccounts.filter((a: any) =>
-          a?.id &&
-          !activeDeletedAccountIds.has(a.id) &&
-          !activeDeletedAccountIds.has(a.studentId) &&
-          !activeDeletedAccountIds.has(a.email) &&
-          !activeDeletedAccountIds.has(a.fullName)
-        )
+        finalAccounts = finalAccounts.filter((a: any) => !isAccountDeletedBySet(a, activeDeletedAccountIds))
       }
       cachedAccounts = finalAccounts
+
+      let finalActivities = activitiesFromDb !== null ? activitiesFromDb : cachedActivities
+      if (Array.isArray(finalActivities) && activeDeletedActivityIds.size > 0) {
+        finalActivities = finalActivities.filter((a: any) => a?.id && !activeDeletedActivityIds.has(a.id))
+      }
+
+      let finalSurveyFeedbacks = surveyFeedbacksFromDb || cachedSurveyFeedbacks || []
+      if (Array.isArray(finalSurveyFeedbacks) && activeDeletedSurveyEventIds.size > 0) {
+        const deletedEventNames = new Set(
+          ((surveyEventsFromDb || cachedSurveyEvents || []) as any[])
+            .filter((e: any) => e?.id && activeDeletedSurveyEventIds.has(e.id))
+            .map((e: any) => e.name)
+        )
+        if (deletedEventNames.size > 0) {
+          finalSurveyFeedbacks = finalSurveyFeedbacks.filter((f: any) => !deletedEventNames.has(f.event))
+        }
+      }
 
       // Giữ toàn bộ thành viên hiện có (bao gồm thành viên thêm mới) và loại bỏ thành viên đã xóa
       let finalMembers = membersFromDb || cachedMembers || INITIAL_MEMBERS
@@ -393,12 +441,14 @@ export async function GET(request: Request) {
           accounts: finalAccounts,
           deletedAccountIds: Array.from(activeDeletedAccountIds),
           deletedMemberCodes: Array.from(activeDeletedMemberCodes),
-          activities: activitiesFromDb !== null ? activitiesFromDb : cachedActivities,
+          activities: finalActivities,
+          deletedActivityIds: Array.from(activeDeletedActivityIds),
           schedulePendingRequests: schedulePendingRequestsFromDb !== null ? schedulePendingRequestsFromDb : (cachedSchedulePendingRequests || []),
           surveyEvents: finalSurveyEvents,
-          surveyFeedbacks: surveyFeedbacksFromDb || cachedSurveyFeedbacks || [],
+          surveyFeedbacks: finalSurveyFeedbacks,
           deletedSurveyEventIds: Array.from(activeDeletedSurveyEventIds),
           surveyCustomQuestions: surveyCustomQuestionsFromDb || cachedSurveyCustomQuestions || {},
+          bcnSurveyNotes: bcnSurveyNotesFromDb || cachedBcnSurveyNotes || {},
           source: 'supabase_cloud',
         },
         {
@@ -443,26 +493,29 @@ export async function GET(request: Request) {
     const fallbackDeletedAccountIds = new Set(cachedDeletedAccountIds || [])
     let fallbackAccounts = (cachedAccounts && cachedAccounts.length > 0) ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
     if (fallbackDeletedAccountIds.size > 0 && Array.isArray(fallbackAccounts)) {
-      fallbackAccounts = fallbackAccounts.filter(
-        (a: any) =>
-          !fallbackDeletedAccountIds.has(a.id) &&
-          !fallbackDeletedAccountIds.has(a.studentId) &&
-          !fallbackDeletedAccountIds.has(a.email)
-      )
+      fallbackAccounts = fallbackAccounts.filter((a: any) => !isAccountDeletedBySet(a, fallbackDeletedAccountIds))
     }
 
+    const fallbackDelMemberSet = new Set(cachedDeletedMemberCodes || [])
     let fallbackMembers = cachedMembers || INITIAL_MEMBERS
     if (Array.isArray(fallbackMembers)) {
-      const validInitialCodeSet = new Set(INITIAL_MEMBERS.map((m) => m.member_code))
-      fallbackMembers = fallbackMembers.filter((m: any) => m?.member_code && validInitialCodeSet.has(m.member_code))
+      fallbackMembers = fallbackMembers.filter(
+        (m: any) => m?.member_code && !fallbackDelMemberSet.has(m.member_code)
+      )
       const existingCodes = new Set(fallbackMembers.map((m: any) => m.member_code))
-      const missingInitial = INITIAL_MEMBERS.filter((m) => !existingCodes.has(m.member_code))
+      const missingInitial = INITIAL_MEMBERS.filter(
+        (m) => !existingCodes.has(m.member_code) && !fallbackDelMemberSet.has(m.member_code)
+      )
       if (missingInitial.length > 0) {
         fallbackMembers = [...fallbackMembers, ...missingInitial]
       }
     }
 
-    const fallbackActivities = cachedActivities || INITIAL_ACTIVITIES
+    const fallbackDelActivitySet = new Set(cachedDeletedActivityIds || [])
+    let fallbackActivities = cachedActivities !== null ? cachedActivities : INITIAL_ACTIVITIES
+    if (Array.isArray(fallbackActivities) && fallbackDelActivitySet.size > 0) {
+      fallbackActivities = fallbackActivities.filter((a: any) => a?.id && !fallbackDelActivitySet.has(a.id))
+    }
 
     return NextResponse.json(
       {
@@ -481,13 +534,15 @@ export async function GET(request: Request) {
         deletedPeriodIds: cachedDeletedPeriodIds || [],
         accounts: fallbackAccounts,
         deletedAccountIds: Array.from(fallbackDeletedAccountIds),
-        deletedMemberCodes: Array.from(cachedDeletedMemberCodes || []),
+        deletedMemberCodes: Array.from(fallbackDelMemberSet),
         activities: fallbackActivities,
+        deletedActivityIds: Array.from(fallbackDelActivitySet),
         schedulePendingRequests: cachedSchedulePendingRequests || [],
         surveyEvents: fallbackSurveyEvents,
         surveyFeedbacks: cachedSurveyFeedbacks || [],
         deletedSurveyEventIds: Array.from(fallbackDeletedSurveyEventIds),
         surveyCustomQuestions: cachedSurveyCustomQuestions || {},
+        bcnSurveyNotes: cachedBcnSurveyNotes || {},
         source: 'cache_memory',
       },
       {
@@ -506,10 +561,16 @@ export async function GET(request: Request) {
       errorFallbackEvents = errorFallbackEvents.filter((e: any) => !errorFallbackDeletedEventIds.has(e.id))
     }
 
+    const errorDelMemberSet = new Set(cachedDeletedMemberCodes || [])
     let errorFallbackMembers = cachedMembers || INITIAL_MEMBERS
     if (Array.isArray(errorFallbackMembers)) {
+      errorFallbackMembers = errorFallbackMembers.filter(
+        (m: any) => m?.member_code && !errorDelMemberSet.has(m.member_code)
+      )
       const existingCodes = new Set(errorFallbackMembers.map((m: any) => m.member_code))
-      const missingInitial = INITIAL_MEMBERS.filter((m) => !existingCodes.has(m.member_code))
+      const missingInitial = INITIAL_MEMBERS.filter(
+        (m) => !existingCodes.has(m.member_code) && !errorDelMemberSet.has(m.member_code)
+      )
       if (missingInitial.length > 0) {
         errorFallbackMembers = [...errorFallbackMembers, ...missingInitial]
       }
@@ -518,7 +579,7 @@ export async function GET(request: Request) {
     let errorFallbackAccounts = (cachedAccounts && cachedAccounts.length > 0) ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
     const errorDelAccSet = new Set(cachedDeletedAccountIds || [])
     if (errorDelAccSet.size > 0 && Array.isArray(errorFallbackAccounts)) {
-      errorFallbackAccounts = errorFallbackAccounts.filter((a: any) => !errorDelAccSet.has(a.id) && !errorDelAccSet.has(a.studentId))
+      errorFallbackAccounts = errorFallbackAccounts.filter((a: any) => !isAccountDeletedBySet(a, errorDelAccSet))
     }
 
     return NextResponse.json({
@@ -532,13 +593,17 @@ export async function GET(request: Request) {
       customPeriodScores: cachedPeriodScores,
       deletedProposalIds: cachedDeletedProposalIds || [],
       deletedEventIds: cachedDeletedEventIds || [],
+      deletedPeriodIds: cachedDeletedPeriodIds || [],
+      deletedMemberCodes: Array.from(errorDelMemberSet),
       accounts: errorFallbackAccounts,
       deletedAccountIds: Array.from(errorDelAccSet),
-      activities: cachedActivities || INITIAL_ACTIVITIES,
+      activities: cachedActivities !== null ? cachedActivities : INITIAL_ACTIVITIES,
+      deletedActivityIds: cachedDeletedActivityIds || [],
       surveyEvents: cachedSurveyEvents,
       surveyFeedbacks: cachedSurveyFeedbacks || [],
       deletedSurveyEventIds: cachedDeletedSurveyEventIds || [],
       surveyCustomQuestions: cachedSurveyCustomQuestions || {},
+      bcnSurveyNotes: cachedBcnSurveyNotes || {},
       error: msg,
       source: 'fallback',
     })
@@ -573,15 +638,20 @@ export async function POST(request: Request) {
       accounts,
       deletedAccountIds,
       accountId,
+      unblockAccountIdentities,
       deletedMemberCodes,
       member,
       activities,
+      deletedActivityIds,
+      activityId,
       schedulePendingRequests,
       surveyEvents,
       surveyFeedbacks,
       deletedSurveyEventIds,
       surveyEventId,
+      surveyEventName,
       surveyCustomQuestions,
+      bcnSurveyNotes,
     } = body
     const supabase = createAdminClient()
 
@@ -691,7 +761,8 @@ export async function POST(request: Request) {
     }
 
     // 0.3 Quản lý danh sách ID tài khoản đã xóa (Tombstones để đồng bộ nhất quán giữa Điện thoại và Máy tính)
-    if (deletedAccountIds !== undefined || (action === 'delete_account' && accountId)) {
+    const hasUnblockIdentities = Array.isArray(unblockAccountIdentities) && unblockAccountIdentities.length > 0
+    if (deletedAccountIds !== undefined || (action === 'delete_account' && accountId) || hasUnblockIdentities) {
       if (cachedDeletedAccountIds === null) {
         cachedDeletedAccountIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_account_ids')
       }
@@ -713,13 +784,15 @@ export async function POST(request: Request) {
       }
 
       // Tự động mở rộng bí danh cho Trần Đức Thắng nếu có thao tác xóa
-      for (const item of [...incomingDelAcc]) {
-        const clean = String(item).toLowerCase().trim()
-        if (clean === 'acc-thang' || clean === '24310088' || clean === 'tdthang@vnuis.edu.vn') {
-          if (!incomingDelAcc.includes('acc-thang')) incomingDelAcc.push('acc-thang')
-          if (!incomingDelAcc.includes('24310088')) incomingDelAcc.push('24310088')
-          if (!incomingDelAcc.includes('tdthang@vnuis.edu.vn')) incomingDelAcc.push('tdthang@vnuis.edu.vn')
-          if (!incomingDelAcc.includes('user-dept-head')) incomingDelAcc.push('user-dept-head')
+      if (action === 'delete_account' || deletedAccountIds !== undefined) {
+        for (const item of [...incomingDelAcc]) {
+          const clean = String(item).toLowerCase().trim()
+          if (clean === 'acc-thang' || clean === '24310088' || clean === 'tdthang@vnuis.edu.vn') {
+            if (!incomingDelAcc.includes('acc-thang')) incomingDelAcc.push('acc-thang')
+            if (!incomingDelAcc.includes('24310088')) incomingDelAcc.push('24310088')
+            if (!incomingDelAcc.includes('tdthang@vnuis.edu.vn')) incomingDelAcc.push('tdthang@vnuis.edu.vn')
+            if (!incomingDelAcc.includes('user-dept-head')) incomingDelAcc.push('user-dept-head')
+          }
         }
       }
 
@@ -727,15 +800,26 @@ export async function POST(request: Request) {
         ...(cachedDeletedAccountIds || []),
         ...incomingDelAcc,
       ])
+
+      // Khi BCN cấp lại tài khoản mới cho một người từng có tài khoản bị xóa:
+      // gỡ studentId/email/fullName khỏi tombstone (giữ nguyên acc-... cũ đã xóa)
+      if (hasUnblockIdentities) {
+        const unblockLower = new Set(
+          unblockAccountIdentities
+            .map((v: any) => String(v || '').toLowerCase().trim())
+            .filter(Boolean)
+        )
+        for (const existingDel of Array.from(combinedDelAccSet)) {
+          if (unblockLower.has(String(existingDel).toLowerCase().trim())) {
+            combinedDelAccSet.delete(existingDel)
+          }
+        }
+      }
+
       cachedDeletedAccountIds = Array.from(combinedDelAccSet)
 
       if (Array.isArray(cachedAccounts)) {
-        cachedAccounts = cachedAccounts.filter(
-          (a: any) =>
-            !combinedDelAccSet.has(a.id) &&
-            !combinedDelAccSet.has(a.studentId) &&
-            !combinedDelAccSet.has(a.email)
-        )
+        cachedAccounts = cachedAccounts.filter((a: any) => !isAccountDeletedBySet(a, combinedDelAccSet))
       }
 
       await saveSetting(
@@ -789,34 +873,39 @@ export async function POST(request: Request) {
         }
       }
 
-      let updatedEvents = cachedEvents || []
+      let updatedEvents = Array.isArray(cachedEvents) ? cachedEvents : []
 
       if (action === 'delete_event' && eventId) {
-        // Xóa sự kiện cụ thể
+        // Xóa sự kiện cụ thể (không ghi đè thô bằng events snapshot cũ từ client)
         updatedEvents = updatedEvents.filter((e: any) => e.id !== eventId)
-        if (Array.isArray(events)) {
-          updatedEvents = events.filter((e: any) => e.id !== eventId)
-        }
       } else if (action === 'create_event' && event) {
-        // Đẩy sự kiện mới lên đầu danh sách và giữ nguyên các sự kiện cũ
+        // Đẩy sự kiện mới lên đầu danh sách và giữ nguyên toàn bộ sự kiện & check-in hiện có
         updatedEvents = [event, ...updatedEvents.filter((e: any) => e.id !== event.id)]
       } else if (action === 'update_event' && eventId && (event || body.event)) {
-        // Cập nhật thông tin sự kiện
         const evUpdates = event || body.event
+        const hasEvt = updatedEvents.some((evt: any) => evt.id === eventId)
+        if (!hasEvt && Array.isArray(events)) {
+          const fallbackEvt = events.find((e: any) => e.id === eventId)
+          if (fallbackEvt) updatedEvents = [fallbackEvt, ...updatedEvents]
+        }
         updatedEvents = updatedEvents.map((evt: any) => {
           if (evt.id === eventId) {
             return {
               ...evt,
               ...evUpdates,
+              // Bảo toàn danh sách check-in và đăng ký hiện có trên server
+              records: evt.records || evUpdates.records || {},
+              registeredMemberCodes: evUpdates.registeredMemberCodes || evt.registeredMemberCodes || [],
             }
           }
           return evt
         })
-        if (Array.isArray(events)) {
-          updatedEvents = events
-        }
       } else if (action === 'update_event_attendees' && eventId && Array.isArray(body.registeredMemberCodes)) {
-        // Cập nhật danh sách thành viên đăng ký theo danh sách CLB
+        const hasEvt = updatedEvents.some((evt: any) => evt.id === eventId)
+        if (!hasEvt && Array.isArray(events)) {
+          const fallbackEvt = events.find((e: any) => e.id === eventId)
+          if (fallbackEvt) updatedEvents = [fallbackEvt, ...updatedEvents]
+        }
         updatedEvents = updatedEvents.map((evt: any) => {
           if (evt.id === eventId) {
             return {
@@ -826,11 +915,19 @@ export async function POST(request: Request) {
           }
           return evt
         })
-        if (Array.isArray(events)) {
-          updatedEvents = events
-        }
+      } else if (action === 'register' && eventId && memberCode) {
+        updatedEvents = updatedEvents.map((evt: any) => {
+          if (evt.id === eventId) {
+            const cur = evt.registeredMemberCodes || []
+            return {
+              ...evt,
+              registeredMemberCodes: cur.includes(memberCode) ? cur : [...cur, memberCode],
+            }
+          }
+          return evt
+        })
       } else if (action === 'unregister' && eventId && memberCode) {
-        // Hủy đăng ký 1 thành viên
+        // Hủy đăng ký 1 thành viên trên server state
         updatedEvents = updatedEvents.map((evt: any) => {
           if (evt.id === eventId) {
             return {
@@ -840,26 +937,34 @@ export async function POST(request: Request) {
           }
           return evt
         })
-        if (Array.isArray(events)) {
-          updatedEvents = events
-        }
       } else if (action === 'checkin' && eventId && memberCode) {
+        const existingEvt = updatedEvents.find((evt: any) => evt.id === eventId)
+        if (!existingEvt && Array.isArray(events)) {
+          const fallbackEvt = events.find((e: any) => e.id === eventId)
+          if (fallbackEvt) updatedEvents = [fallbackEvt, ...updatedEvents]
+        }
         // Cập nhật điểm danh 1 thành viên
         updatedEvents = updatedEvents.map((evt: any) => {
           if (evt.id === eventId) {
+            const prevRec = evt.records?.[memberCode]
+            const resolvedStatus = status || 'present_on_time'
+            const isPresentStatus = resolvedStatus === 'present_on_time' || resolvedStatus === 'late'
             return {
               ...evt,
               records: {
                 ...(evt.records || {}),
                 [memberCode]: {
+                  ...(prevRec || {}),
                   memberCode,
-                  status: status || 'present_on_time',
-                  note: note || '',
-                  checkinTime: new Date().toLocaleTimeString('vi-VN', {
-                    timeZone: 'Asia/Ho_Chi_Minh',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  }),
+                  status: resolvedStatus,
+                  note: note !== undefined ? note : (prevRec?.note || ''),
+                  checkinTime: isPresentStatus
+                    ? (prevRec?.checkinTime || new Date().toLocaleTimeString('vi-VN', {
+                        timeZone: 'Asia/Ho_Chi_Minh',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      }))
+                    : undefined,
                 },
               },
             }
@@ -1000,31 +1105,55 @@ export async function POST(request: Request) {
     }
 
     if (members !== undefined || action === 'add_member' || action === 'delete_member') {
-      if (cachedMembers === null && members === undefined) {
+      if (cachedMembers === null) {
         cachedMembers = await loadSettingJson<any[]>(supabase, 'issac_members_cloud')
       }
       if (cachedDeletedMemberCodes === null) {
         cachedDeletedMemberCodes = await loadSettingJson<string[]>(supabase, 'issac_deleted_member_codes_v2')
       }
       const activeDelMemSet = new Set(cachedDeletedMemberCodes || [])
-      let baseMembers = members !== undefined ? members : (cachedMembers || INITIAL_MEMBERS)
-      if (!Array.isArray(baseMembers)) baseMembers = []
-
-      if (action === 'delete_member' && memberCode) {
-        baseMembers = baseMembers.filter((m: any) => m.member_code !== memberCode)
+      if (action === 'add_member' && member?.member_code) {
+        activeDelMemSet.delete(member.member_code)
       }
 
-      if (action === 'add_member' && member) {
-        const existingIdx = baseMembers.findIndex((m: any) => m.member_code === member.member_code)
-        if (existingIdx >= 0) {
-          baseMembers[existingIdx] = member
-        } else {
-          baseMembers.push(member)
+      const memberMap = new Map<string, any>()
+      const serverMembers = Array.isArray(cachedMembers) && cachedMembers.length > 0 ? cachedMembers : INITIAL_MEMBERS
+      for (const sm of serverMembers) {
+        if (sm?.member_code && !activeDelMemSet.has(sm.member_code)) {
+          memberMap.set(sm.member_code, sm)
         }
       }
 
+      if (Array.isArray(members)) {
+        for (const incomingM of members) {
+          if (!incomingM?.member_code || activeDelMemSet.has(incomingM.member_code)) continue
+          const existing = memberMap.get(incomingM.member_code)
+          if (!existing) {
+            memberMap.set(incomingM.member_code, incomingM)
+          } else {
+            const existingTime = existing.updated_at ? new Date(existing.updated_at).getTime() : 0
+            const incomingTime = incomingM.updated_at ? new Date(incomingM.updated_at).getTime() : 0
+            if (incomingTime >= existingTime) {
+              memberMap.set(incomingM.member_code, {
+                ...existing,
+                ...incomingM,
+                avatar_url: incomingM.avatar_url || existing.avatar_url,
+              })
+            }
+          }
+        }
+      }
+
+      if (action === 'add_member' && member?.member_code && !activeDelMemSet.has(member.member_code)) {
+        memberMap.set(member.member_code, member)
+      }
+
+      if (action === 'delete_member' && memberCode) {
+        memberMap.delete(memberCode)
+      }
+
       // Giữ cả thành viên mới thêm, chỉ loại bỏ các thành viên đã xóa và cắt avatar quá lớn
-      let cleanMembers = baseMembers
+      let cleanMembers = Array.from(memberMap.values())
         .filter((m: any) => m?.member_code && !activeDelMemSet.has(m.member_code))
         .map((m: any) => ({
           ...m,
@@ -1089,11 +1218,31 @@ export async function POST(request: Request) {
       )
     }
 
-    if (periods !== undefined) {
+    if (periods !== undefined || (action === 'delete_period' && periodId)) {
+      if (cachedPeriods === null) {
+        cachedPeriods = await loadSettingJson<any[]>(supabase, 'issac_periods_cloud')
+      }
+      if (cachedDeletedPeriodIds === null) {
+        cachedDeletedPeriodIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_period_ids')
+      }
       const activeDelPerSet = new Set(cachedDeletedPeriodIds || [])
-      const cleanPeriods = Array.isArray(periods)
-        ? periods.filter((p: any) => p?.id && !activeDelPerSet.has(p.id))
-        : periods
+      if (action === 'delete_period' && periodId) {
+        activeDelPerSet.add(periodId)
+      }
+
+      const periodMap = new Map<string, any>()
+      const existingPeriods = Array.isArray(cachedPeriods) ? cachedPeriods : AVAILABLE_PERIODS
+      for (const p of existingPeriods) {
+        if (p?.id && !activeDelPerSet.has(p.id)) periodMap.set(p.id, p)
+      }
+      if (Array.isArray(periods)) {
+        for (const p of periods) {
+          if (p?.id && !activeDelPerSet.has(p.id)) {
+            periodMap.set(p.id, { ...(periodMap.get(p.id) || {}), ...p })
+          }
+        }
+      }
+      const cleanPeriods = Array.from(periodMap.values())
       cachedPeriods = cleanPeriods
       await saveSetting(
         'issac_periods_cloud',
@@ -1121,6 +1270,9 @@ export async function POST(request: Request) {
     }
 
     if (customRules !== undefined) {
+      if (cachedCustomRules === null) {
+        cachedCustomRules = await loadSettingJson<any[]>(supabase, 'issac_custom_rules_cloud')
+      }
       cachedCustomRules = customRules
       await saveSetting(
         'issac_custom_rules_cloud',
@@ -1129,20 +1281,57 @@ export async function POST(request: Request) {
       )
     }
 
-    if (customPeriodScores !== undefined) {
-      cachedPeriodScores = customPeriodScores
+    if (customPeriodScores !== undefined || (action === 'delete_period' && periodId)) {
+      if (cachedPeriodScores === null) {
+        cachedPeriodScores = await loadSettingJson<Record<string, any>>(supabase, 'issac_custom_period_scores')
+      }
+      const mergedScores: Record<string, any> = { ...(cachedPeriodScores || {}) }
+      if (customPeriodScores && typeof customPeriodScores === 'object') {
+        for (const [pid, deltaMap] of Object.entries(customPeriodScores)) {
+          if (action === 'reset_period_scores' && pid === periodId) {
+            mergedScores[pid] = {}
+          } else if (deltaMap && typeof deltaMap === 'object') {
+            mergedScores[pid] = {
+              ...(mergedScores[pid] || {}),
+              ...(deltaMap as Record<string, number>),
+            }
+          }
+        }
+      }
+      if (action === 'delete_period' && periodId) {
+        delete mergedScores[periodId]
+      }
+      cachedPeriodScores = mergedScores
       await saveSetting(
         'issac_custom_period_scores',
-        JSON.stringify(customPeriodScores),
+        JSON.stringify(mergedScores),
         'Cloud synchronized period scores for iSSAC Web'
       )
     }
 
-    if (accounts !== undefined) {
+    if (accounts !== undefined || action === 'create_account' || action === 'update_account') {
+      if (cachedDeletedAccountIds === null) {
+        cachedDeletedAccountIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_account_ids')
+      }
+      if (cachedAccounts === null) {
+        cachedAccounts = await loadSettingJson<any[]>(supabase, 'issac_issued_accounts_cloud')
+      }
       const activeDelAccSet = new Set(cachedDeletedAccountIds || [])
-      const cleanAccounts = Array.isArray(accounts)
-        ? accounts.filter((a: any) => a?.id && !activeDelAccSet.has(a.id))
-        : accounts
+      const accMap = new Map<string, any>()
+      const existingAccs = Array.isArray(cachedAccounts) && cachedAccounts.length > 0 ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
+      for (const a of existingAccs) {
+        if (a?.id && !isAccountDeletedBySet(a, activeDelAccSet)) {
+          accMap.set(a.id, a)
+        }
+      }
+      if (Array.isArray(accounts)) {
+        for (const a of accounts) {
+          if (a?.id && !isAccountDeletedBySet(a, activeDelAccSet)) {
+            accMap.set(a.id, { ...(accMap.get(a.id) || {}), ...a })
+          }
+        }
+      }
+      const cleanAccounts = Array.from(accMap.values())
       cachedAccounts = cleanAccounts
       await saveSetting(
         'issac_issued_accounts_cloud',
@@ -1151,11 +1340,40 @@ export async function POST(request: Request) {
       )
     }
 
-    if (activities !== undefined) {
-      cachedActivities = activities
+    if (deletedActivityIds !== undefined || (action === 'delete_activity' && activityId)) {
+      if (cachedDeletedActivityIds === null) {
+        cachedDeletedActivityIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_activity_ids')
+      }
+      const incomingDelAct = Array.isArray(deletedActivityIds) ? [...deletedActivityIds] : []
+      if (action === 'delete_activity' && activityId && !incomingDelAct.includes(activityId)) {
+        incomingDelAct.push(activityId)
+      }
+      cachedDeletedActivityIds = Array.from(new Set([...(cachedDeletedActivityIds || []), ...incomingDelAct]))
+      await saveSetting(
+        'issac_deleted_activity_ids',
+        JSON.stringify(cachedDeletedActivityIds),
+        'Cloud synchronized deleted activity IDs for iSSAC Web'
+      )
+    }
+
+    if (activities !== undefined || (action === 'delete_activity' && activityId)) {
+      if (cachedActivities === null) {
+        cachedActivities = await loadSettingJson<any[]>(supabase, 'issac_activities_cloud')
+      }
+      if (cachedDeletedActivityIds === null) {
+        cachedDeletedActivityIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_activity_ids')
+      }
+      const activeDelActSet = new Set(cachedDeletedActivityIds || [])
+      let nextActivities = Array.isArray(activities)
+        ? activities.filter((a: any) => a?.id && !activeDelActSet.has(a.id))
+        : (cachedActivities || [])
+      if (action === 'delete_activity' && activityId) {
+        nextActivities = nextActivities.filter((a: any) => a.id !== activityId)
+      }
+      cachedActivities = nextActivities
       await saveSetting(
         'issac_activities_cloud',
-        JSON.stringify(activities),
+        JSON.stringify(nextActivities),
         'Cloud synchronized activities schedule for iSSAC Web'
       )
     }
@@ -1177,6 +1395,16 @@ export async function POST(request: Request) {
       if (cachedSurveyEvents === null) {
         cachedSurveyEvents = await loadSettingJson<any[]>(supabase, 'issac_survey_events_cloud')
       }
+      if (cachedSurveyFeedbacks === null) {
+        cachedSurveyFeedbacks = await loadSettingJson<any[]>(supabase, 'issac_survey_feedbacks_cloud')
+      }
+
+      const deletedTargetName =
+        surveyEventName ||
+        (Array.isArray(cachedSurveyEvents)
+          ? cachedSurveyEvents.find((e: any) => e.id === surveyEventId)?.name
+          : undefined)
+
       const incomingDelSurvey = Array.isArray(deletedSurveyEventIds) ? deletedSurveyEventIds : []
       if (action === 'delete_survey_event' && surveyEventId && !incomingDelSurvey.includes(surveyEventId)) {
         incomingDelSurvey.push(surveyEventId)
@@ -1185,10 +1413,23 @@ export async function POST(request: Request) {
         ...(cachedDeletedSurveyEventIds || []),
         ...incomingDelSurvey,
       ])
+      if (action === 'restore_survey_events') {
+        combinedDelSurveySet.clear()
+      }
       cachedDeletedSurveyEventIds = Array.from(combinedDelSurveySet)
 
       if (cachedSurveyEvents && Array.isArray(cachedSurveyEvents)) {
         cachedSurveyEvents = cachedSurveyEvents.filter((e: any) => !combinedDelSurveySet.has(e.id))
+      }
+
+      // Dọn sạch feedbacks thuộc sự kiện khảo sát vừa bị xóa khỏi Cloud
+      if (action === 'delete_survey_event' && deletedTargetName && Array.isArray(cachedSurveyFeedbacks)) {
+        cachedSurveyFeedbacks = cachedSurveyFeedbacks.filter((f: any) => f.event !== deletedTargetName)
+        await saveSetting(
+          'issac_survey_feedbacks_cloud',
+          JSON.stringify(cachedSurveyFeedbacks),
+          'Cloud synchronized survey feedbacks for iSSAC Web'
+        )
       }
 
       await saveSetting(
@@ -1199,6 +1440,12 @@ export async function POST(request: Request) {
     }
 
     if (surveyEvents !== undefined) {
+      if (cachedDeletedSurveyEventIds === null) {
+        cachedDeletedSurveyEventIds = await loadSettingJson<string[]>(supabase, 'issac_deleted_survey_event_ids')
+      }
+      if (cachedSurveyEvents === null) {
+        cachedSurveyEvents = await loadSettingJson<any[]>(supabase, 'issac_survey_events_cloud')
+      }
       const activeDelSurveySet = new Set(cachedDeletedSurveyEventIds || [])
       const cleanSurveyEvents = Array.isArray(surveyEvents)
         ? surveyEvents.filter((e: any) => e?.id && !activeDelSurveySet.has(e.id))
@@ -1213,10 +1460,40 @@ export async function POST(request: Request) {
     }
 
     if (surveyFeedbacks !== undefined) {
-      cachedSurveyFeedbacks = surveyFeedbacks
+      if (cachedSurveyFeedbacks === null) {
+        cachedSurveyFeedbacks = await loadSettingJson<any[]>(supabase, 'issac_survey_feedbacks_cloud')
+      }
+      const fbMap = new Map<string, any>()
+      const getFbKey = (f: any) =>
+        f?.event && f?.targetMemberCode && f?.evaluatorMemberCode
+          ? `${f.event}::${f.targetMemberCode}::${f.evaluatorMemberCode}`
+          : String(f?.id || Math.random())
+
+      const existingFb = Array.isArray(cachedSurveyFeedbacks) ? cachedSurveyFeedbacks : []
+      for (const f of existingFb) {
+        if (f) fbMap.set(getFbKey(f), f)
+      }
+      if (Array.isArray(surveyFeedbacks)) {
+        for (const f of surveyFeedbacks) {
+          if (!f) continue
+          const k = getFbKey(f)
+          const prev = fbMap.get(k)
+          if (!prev) {
+            fbMap.set(k, f)
+          } else {
+            const prevTime = prev.submittedAt ? new Date(prev.submittedAt).getTime() : 0
+            const newTime = f.submittedAt ? new Date(f.submittedAt).getTime() : 0
+            if (newTime >= prevTime) {
+              fbMap.set(k, f)
+            }
+          }
+        }
+      }
+      const mergedFeedbacks = Array.from(fbMap.values())
+      cachedSurveyFeedbacks = mergedFeedbacks
       await saveSetting(
         'issac_survey_feedbacks_cloud',
-        JSON.stringify(surveyFeedbacks),
+        JSON.stringify(mergedFeedbacks),
         'Cloud synchronized survey feedbacks for iSSAC Web'
       )
     }
@@ -1233,6 +1510,21 @@ export async function POST(request: Request) {
         'issac_survey_custom_questions_cloud',
         JSON.stringify(cachedSurveyCustomQuestions),
         'Cloud synchronized survey custom questions for iSSAC Web'
+      )
+    }
+
+    if (bcnSurveyNotes !== undefined && typeof bcnSurveyNotes === 'object') {
+      if (cachedBcnSurveyNotes === null) {
+        cachedBcnSurveyNotes = await loadSettingJson<Record<string, string>>(supabase, 'issac_bcn_survey_notes_cloud')
+      }
+      cachedBcnSurveyNotes = {
+        ...(cachedBcnSurveyNotes || {}),
+        ...bcnSurveyNotes,
+      }
+      await saveSetting(
+        'issac_bcn_survey_notes_cloud',
+        JSON.stringify(cachedBcnSurveyNotes),
+        'Cloud synchronized BCN survey notes for iSSAC Web'
       )
     }
 
@@ -1254,11 +1546,13 @@ export async function POST(request: Request) {
       deletedAccountIds: cachedDeletedAccountIds || [],
       deletedMemberCodes: cachedDeletedMemberCodes || [],
       activities: cachedActivities,
+      deletedActivityIds: cachedDeletedActivityIds || [],
       schedulePendingRequests: cachedSchedulePendingRequests || [],
       surveyEvents: cachedSurveyEvents,
       surveyFeedbacks: cachedSurveyFeedbacks || [],
       deletedSurveyEventIds: cachedDeletedSurveyEventIds || [],
       surveyCustomQuestions: cachedSurveyCustomQuestions || {},
+      bcnSurveyNotes: cachedBcnSurveyNotes || {},
       cloudSynced: dbSuccess,
       cloudNote: dbSuccess
         ? 'Đã đồng bộ trực tiếp lên cơ sở dữ liệu Supabase Cloud'

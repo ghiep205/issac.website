@@ -1,4 +1,5 @@
 import { INITIAL_MEMBERS, type RosterMember } from '@/lib/clubData'
+import { createAdminClient } from '@/lib/supabase/admin'
 
 export interface VerificationInput {
   fullName: string
@@ -55,7 +56,8 @@ export function normalizeEmail(email: string): string {
  */
 export function verifyClubMemberIdentity(
   input: VerificationInput,
-  clientIp: string = 'global'
+  clientIp: string = 'global',
+  roster: RosterMember[] = INITIAL_MEMBERS
 ): VerificationResult {
   const genericError =
     'Thông tin xác minh không khớp với danh sách thành viên chính thức của CLB. Vui lòng kiểm tra lại chính xác 4 trường: Họ tên, MSSV, Email và Số điện thoại.'
@@ -91,7 +93,7 @@ export function verifyClubMemberIdentity(
   const normPhone = normalizePhoneNumber(input.phone)
 
   // 4. Exact 4-field match against members
-  const matchedMember = INITIAL_MEMBERS.find((m: RosterMember) => {
+  const matchedMember = roster.find((m: RosterMember) => {
     // Check MSSV (or member_code if student_id not explicitly set)
     const memberMssv = normalizeStudentId(m.student_id || m.member_code)
     if (memberMssv !== normMssv) return false
@@ -140,5 +142,47 @@ export function verifyClubMemberIdentity(
       departmentName: matchedMember.department_name,
     },
   }
+}
+
+/**
+ * Loads live member list from Supabase cloud settings (`issac_members_cloud` / `issac_deleted_member_codes_v2`)
+ * merged with INITIAL_MEMBERS so newly added/edited members can also verify on the fund payment portal.
+ */
+export async function verifyClubMemberIdentityWithCloud(
+  input: VerificationInput,
+  clientIp: string = 'global'
+): Promise<VerificationResult> {
+  let activeRoster: RosterMember[] = INITIAL_MEMBERS
+
+  try {
+    if (process.env.NEXT_PUBLIC_SUPABASE_URL && (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)) {
+      const supabase = createAdminClient()
+      const { data } = await supabase
+        .from('settings')
+        .select('key, value')
+        .in('key', ['issac_members_cloud', 'issac_deleted_member_codes_v2'])
+
+      if (data && data.length > 0) {
+        const memRow = data.find((r) => r.key === 'issac_members_cloud')
+        const delRow = data.find((r) => r.key === 'issac_deleted_member_codes_v2')
+        const delSet = new Set<string>(delRow?.value ? JSON.parse(delRow.value) : [])
+        if (memRow?.value) {
+          const parsed = JSON.parse(memRow.value)
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const cleanedCloud = parsed.filter((m: any) => m?.member_code && !delSet.has(m.member_code))
+            const cloudCodes = new Set(cleanedCloud.map((m: any) => m.member_code))
+            const missingInit = INITIAL_MEMBERS.filter(
+              (m) => !cloudCodes.has(m.member_code) && !delSet.has(m.member_code)
+            )
+            activeRoster = [...cleanedCloud, ...missingInit]
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Cloud member verification fallback to INITIAL_MEMBERS:', err)
+  }
+
+  return verifyClubMemberIdentity(input, clientIp, activeRoster)
 }
 

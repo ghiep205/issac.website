@@ -233,9 +233,13 @@ export function HistoryView() {
   const pendingList = proposals.filter((p) => p.status === 'pending_bcn')
   const pendingDisputesCount = disputes.filter((d) => d.status === 'pending_bcn' || d.status === 'pending_hr_review').length
 
-  // Ghép các bản ghi được approved từ context vào danh sách lịch sử sống
+  // Ghép các bản ghi được approved từ context vào danh sách lịch sử sống và lọc theo chu kỳ đã chọn
   const dynamicHistory = proposals
-    .filter((p) => p.status === 'approved')
+    .filter((p) => {
+      if (p.status !== 'approved') return false
+      if (!selectedPeriodId || selectedPeriodId === 'ALL') return true
+      return p.periodId === selectedPeriodId || (!p.periodId && selectedPeriodId === 'month-2026-10')
+    })
     .map((p) => ({
       id: p.id,
       memberCode: p.memberCode,
@@ -764,6 +768,9 @@ export function HistoryView() {
                 onChange={(e) => setSelectedPeriodId(e.target.value)}
                 className="appearance-none pl-3.5 pr-8 py-1.5 bg-white hover:bg-slate-50/80 border border-slate-200 rounded-xl text-xs font-bold text-[#061651] focus:outline-none focus:border-[#0284C7] focus:ring-1 focus:ring-[#0284C7]/20 transition shadow-2xs cursor-pointer whitespace-nowrap"
               >
+                <option value="ALL">
+                  {language === 'vi' ? 'Tất cả chu kỳ' : 'All Periods'}
+                </option>
                 {monthPeriods.map((p) => (
                   <option key={p.id} value={p.id}>
                     {language === 'en'

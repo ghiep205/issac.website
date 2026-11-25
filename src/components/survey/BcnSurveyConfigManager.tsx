@@ -178,7 +178,7 @@ export function BcnSurveyConfigManager({
     const updated = saveNewSurveyEvent(item)
     try {
       // Đảm bảo sự kiện mới tạo luôn là mới hẳn (0 đánh giá, sạch sẽ dữ liệu)
-      localStorage.setItem(`issac_survey_evaluations_${encodeURIComponent(item.name)}`, JSON.stringify({}))
+      localStorage.setItem(`issac_survey_evaluations_v5_${encodeURIComponent(item.name)}`, JSON.stringify({}))
     } catch (err) {
       console.error(err)
     }

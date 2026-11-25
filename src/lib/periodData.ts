@@ -438,14 +438,14 @@ export function calculatePeriodLeaderboard(
   }
 
   const getMemberDeltaForPeriod = (mCode: string, pId: string): number => {
-    // 1. Ưu tiên điểm tùy chỉnh trong customPeriodDeltas nếu có
-    if (customPeriodDeltas[pId] && customPeriodDeltas[pId][mCode] !== undefined) {
-      return customPeriodDeltas[pId][mCode]
-    }
-    // 2. Điểm tính động trực tiếp từ proposalsList
+    // 1. Ưu tiên điểm tính động trực tiếp từ sổ cái proposalsList (Single Source of Truth đồng bộ đa thiết bị)
     const periodProps = proposalDeltasByPeriod.get(pId)
     if (periodProps && periodProps.has(mCode)) {
       return periodProps.get(mCode)!
+    }
+    // 2. Điểm tùy chỉnh trong customPeriodDeltas (nếu chưa có proposal trực tiếp)
+    if (customPeriodDeltas[pId] && customPeriodDeltas[pId][mCode] !== undefined) {
+      return customPeriodDeltas[pId][mCode]
     }
     // 3. Fallback vào các hằng số chuẩn
     if (pId === 'month-2026-10') {
@@ -486,12 +486,25 @@ export function calculatePeriodLeaderboard(
     })
   }
 
-  // 1. Nếu chu kỳ có lưu delta tùy chỉnh trong sổ cái customPeriodDeltas
+  // 1. Nếu chu kỳ tháng có lưu delta tùy chỉnh trong customPeriodDeltas (không chặn quý/năm và luôn ưu tiên proposalsList đã sync)
   const periodCustomDeltas = customPeriodDeltas[periodId]
-  const hasCustomDeltas = periodCustomDeltas && Object.keys(periodCustomDeltas).length > 0
+  const periodProposalDeltas = proposalDeltasByPeriod.get(periodId)
+  const hasCustomDeltas =
+    !periodId.startsWith('quarter-') &&
+    !periodId.startsWith('year-') &&
+    periodCustomDeltas &&
+    Object.keys(periodCustomDeltas).length > 0
   if (hasCustomDeltas) {
     const list = activeMembers.map((m) => {
-      const delta = periodCustomDeltas[m.member_code] ?? (isLocked ? getMemberDeltaForPeriod(m.member_code, periodId) : 0)
+      const propDelta = periodProposalDeltas?.get(m.member_code)
+      const delta =
+        propDelta !== undefined
+          ? propDelta
+          : periodCustomDeltas[m.member_code] !== undefined
+          ? periodCustomDeltas[m.member_code]
+          : isLocked
+          ? getMemberDeltaForPeriod(m.member_code, periodId)
+          : 0
       const finalScore = Math.max(0, Math.min(100, STANDARD_MONTHLY_BASELINE + delta))
       return {
         member: m,

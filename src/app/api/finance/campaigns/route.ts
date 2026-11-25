@@ -30,7 +30,7 @@ export async function POST(request: Request) {
       defaultAmount: Number(defaultAmount),
       startDate: startDate || new Date().toISOString(),
       endDate: endDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-      targetCount: Number(targetCount) || 48,
+      targetCount: Number(targetCount) || 47,
       status: 'active',
       isFrozen: false,
       createdBy: createdBy || 'Ban Quản trị',

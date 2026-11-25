@@ -42,6 +42,7 @@ import {
   getStoredSurveyFeedbacks,
   getStoredSurveyEvents,
   updateSurveyEventStatus,
+  syncSurveyToCloud,
   SurveyFeedbackItem,
   SurveyEventItem,
 } from '@/lib/surveyData'
@@ -111,6 +112,10 @@ export function BcnSurveyReportView({
     const handleStorage = () => {
       setFeedbacks(getStoredSurveyFeedbacks())
       setSurveyEvents(getStoredSurveyEvents())
+      try {
+        const savedNotes = localStorage.getItem('issac_bcn_survey_notes_v1')
+        if (savedNotes) setBcnNotes(JSON.parse(savedNotes))
+      } catch {}
     }
     window.addEventListener('storage', handleStorage)
     return () => window.removeEventListener('storage', handleStorage)
@@ -399,6 +404,10 @@ export function BcnSurveyReportView({
     setBcnNotes(updated)
     try {
       localStorage.setItem('issac_bcn_survey_notes_v1', JSON.stringify(updated))
+      syncSurveyToCloud({
+        action: 'save_bcn_survey_notes',
+        bcnSurveyNotes: updated,
+      })
       setToastNoteSaved(true)
       setTimeout(() => setToastNoteSaved(false), 2500)
     } catch (e) {
@@ -1478,8 +1487,15 @@ export function BcnSurveyReportView({
                     )}
                   </div>
                   <textarea
+                    key={activeMemberObj.member.member_code}
                     rows={2}
-                    defaultValue={bcnNotes[activeMemberObj.member.member_code] || ''}
+                    value={bcnNotes[activeMemberObj.member.member_code] || ''}
+                    onChange={(e) =>
+                      setBcnNotes((prev) => ({
+                        ...prev,
+                        [activeMemberObj.member.member_code]: e.target.value,
+                      }))
+                    }
                     onBlur={(e) => handleSaveBcnNote(activeMemberObj.member.member_code, e.target.value)}
                     placeholder="Nhập ghi chú riêng của BCN (định hướng bồi dưỡng, phân công sự kiện tới, lưu ý khen thưởng...)"
                     className="w-full px-3.5 py-2.5 rounded-xl border-0 shadow-[0_2px_8px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] bg-white dark:bg-slate-900 text-xs text-slate-800 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-400/60 focus:shadow-[0_4px_12px_rgba(217,119,6,0.12)] transition-all min-h-[60px] resize-y"

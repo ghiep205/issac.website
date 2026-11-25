@@ -23,7 +23,7 @@ import {
 
 export default function MyScorePage() {
   const router = useRouter()
-  const { members, proposals, events, createDispute } = useClub()
+  const { members, proposals, events, currentActivePeriodId } = useClub()
   const { currentUser, isAuthChecked } = useAuth()
 
   useEffect(() => {
@@ -33,26 +33,36 @@ export default function MyScorePage() {
   }, [isAuthChecked, currentUser, router])
 
   // Default to currentUser's memberCode if exists, or first member
-  const initialCode = currentUser?.memberCode || members[0]?.member_code
+  const initialCode = currentUser?.memberCode || members[0]?.member_code || ''
   const [selectedCode, setSelectedCode] = useState<string>(initialCode)
   const [disputeModalOpen, setDisputeModalOpen] = useState(false)
 
-  if (!isAuthChecked) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-[#FAFBFC] dark:bg-[#0B1120]">
-        <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin" />
-      </div>
-    )
-  }
-
-  if (!currentUser) return null
+  useEffect(() => {
+    if (currentUser?.memberCode) {
+      setSelectedCode(currentUser.memberCode)
+    }
+  }, [currentUser?.memberCode])
 
   const member: RosterMember =
     members.find((m) => m.member_code === selectedCode) || members[0]
 
-  const rating = getRatingLevel(member.current_score)
+  const interactionQuotaUsed = useMemo(() => {
+    if (!member) return 0
+    const activePid = currentActivePeriodId || 'month-2026-11'
+    const sum = proposals
+      .filter(
+        (p) =>
+          p.status === 'approved' &&
+          p.memberCode === member.member_code &&
+          ['C01', 'C02', 'C03'].includes(p.criterionCode) &&
+          (p.periodId === activePid || (!p.periodId && activePid === 'month-2026-10'))
+      )
+      .reduce((acc, p) => acc + Math.max(0, Number(p.points || 0)), 0)
+    return Math.min(15, sum)
+  }, [proposals, member, currentActivePeriodId])
 
   const historyEntries = useMemo(() => {
+    if (!member) return []
     const list: Array<{
       date: string
       criterion: string
@@ -97,7 +107,7 @@ export default function MyScorePage() {
             date: `${evt.date} ${rec.checkinTime || evt.startTime}`,
             criterion: 'T04',
             criterionName: 'Tham dự sự kiện muộn',
-            delta: -2,
+            delta: -1,
             scoreAfter: member.current_score,
             reason: `Đi muộn: ${evt.title}`,
             approver: 'Hệ thống điểm danh',
@@ -119,6 +129,18 @@ export default function MyScorePage() {
 
     return list
   }, [proposals, events, member])
+
+  if (!isAuthChecked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#FAFBFC] dark:bg-[#0B1120]">
+        <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin" />
+      </div>
+    )
+  }
+
+  if (!currentUser || !member) return null
+
+  const rating = getRatingLevel(member.current_score)
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
@@ -252,12 +274,12 @@ export default function MyScorePage() {
               <span className="font-bold text-slate-300">
                 Hạn ngạch tương tác tháng (C01 + C02 + C03)
               </span>
-              <span className="font-bold text-[#F5B301]">6 / 15 điểm</span>
+              <span className="font-bold text-[#F5B301]">{interactionQuotaUsed} / 15 điểm</span>
             </div>
             <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
               <div
                 className="h-full bg-gradient-to-r from-[#1E63D6] to-[#F5B301] rounded-full"
-                style={{ width: `${(6 / 15) * 100}%` }}
+                style={{ width: `${(interactionQuotaUsed / 15) * 100}%` }}
               />
             </div>
             <p className="text-[11px] text-slate-400">

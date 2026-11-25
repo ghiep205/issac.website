@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { Header } from '@/components/layout/Header'
 import { Sidebar, type ActiveNavTab } from '@/components/layout/Sidebar'
@@ -17,6 +17,25 @@ export default function AdminFinancePage() {
   const [globalSearch, setGlobalSearch] = useState<string>('')
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false)
 
+  useEffect(() => {
+    if (isAuthChecked && !currentUser) {
+      router.replace('/login')
+    }
+  }, [isAuthChecked, currentUser, router])
+
+  if (!isAuthChecked || !currentUser) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#E8EDF3]">
+        <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin" />
+      </div>
+    )
+  }
+
+  const pendingProposalsCount = (proposals || []).filter((p) => p.status === 'pending_bcn').length
+  const pendingDisputesCount = (disputes || []).filter(
+    (d) => d.status === 'pending_bcn' || d.status === 'pending_hr_review'
+  ).length
+
   const handleSelectTab = (tab: ActiveNavTab) => {
     if (tab === 'finance') {
       setActiveTab('finance')
@@ -31,7 +50,7 @@ export default function AdminFinancePage() {
       <Sidebar
         activeTab={activeTab}
         onSelectTab={handleSelectTab}
-        pendingCount={(proposals?.length || 0) + (disputes?.length || 0)}
+        pendingCount={pendingProposalsCount + pendingDisputesCount}
         hasActiveEvent={Boolean(activeEvent)}
         isOpen={isSidebarOpen}
         onToggle={() => setIsSidebarOpen(!isSidebarOpen)}

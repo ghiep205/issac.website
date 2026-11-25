@@ -4,6 +4,8 @@ import {
   calculateEntryHash,
   verifyLedgerIntegrity,
 } from './hashChain'
+import { INITIAL_MEMBERS } from '@/lib/clubData'
+import { createAdminClient } from '@/lib/supabase/admin'
 import type {
   CampaignStatus,
   ExpenseRequest,
@@ -292,6 +294,85 @@ if (!global.__ISSAC_FINANCE_STORE__) {
 
 const store = global.__ISSAC_FINANCE_STORE__
 
+const FINANCE_SETTINGS_KEY = 'issac_finance_store_v1'
+let financeHydratedFromCloud = false
+
+function canUseFinanceSupabase(): boolean {
+  if (typeof process === 'undefined') return false
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') return false
+  return Boolean(
+    process.env.NEXT_PUBLIC_SUPABASE_URL &&
+      (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)
+  )
+}
+
+async function ensureFinanceStoreLoaded(): Promise<void> {
+  if (financeHydratedFromCloud || !canUseFinanceSupabase()) return
+  financeHydratedFromCloud = true
+  try {
+    const supabase = createAdminClient()
+    const { data, error } = await supabase
+      .from('settings')
+      .select('value')
+      .eq('key', FINANCE_SETTINGS_KEY)
+      .maybeSingle()
+
+    if (!error && data?.value) {
+      const parsed = JSON.parse(data.value) as Partial<FinanceStoreState>
+      if (Array.isArray(parsed.campaigns)) store.campaigns = parsed.campaigns
+      if (Array.isArray(parsed.intents)) store.intents = parsed.intents
+      if (Array.isArray(parsed.ledger) && parsed.ledger.length > 0) store.ledger = parsed.ledger
+      if (Array.isArray(parsed.expenses)) store.expenses = parsed.expenses
+      if (Array.isArray(parsed.evidence)) store.evidence = parsed.evidence
+      if (Array.isArray(parsed.auditLogs)) store.auditLogs = parsed.auditLogs
+    }
+  } catch (err) {
+    financeHydratedFromCloud = false
+    console.warn('Finance cloud load notice:', err)
+  }
+}
+
+async function persistFinanceStore(): Promise<void> {
+  if (!canUseFinanceSupabase()) return
+  try {
+    const supabase = createAdminClient()
+    await supabase.from('settings').upsert(
+      {
+        key: FINANCE_SETTINGS_KEY,
+        value: JSON.stringify(store),
+        description: 'Cloud synchronized financial ledger and campaigns for iSSAC Web',
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'key' }
+    )
+  } catch (err) {
+    console.warn('Finance cloud persist notice:', err)
+  }
+}
+
+async function getActiveClubMemberCount(): Promise<number> {
+  if (!canUseFinanceSupabase()) return INITIAL_MEMBERS.length
+  try {
+    const supabase = createAdminClient()
+    const { data } = await supabase
+      .from('settings')
+      .select('key, value')
+      .in('key', ['issac_members_cloud', 'issac_deleted_member_codes_v2'])
+    if (data && data.length > 0) {
+      const memRow = data.find((r) => r.key === 'issac_members_cloud')
+      const delRow = data.find((r) => r.key === 'issac_deleted_member_codes_v2')
+      const delSet = new Set<string>(delRow?.value ? JSON.parse(delRow.value) : [])
+      if (memRow?.value) {
+        const parsed = JSON.parse(memRow.value)
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed.filter((m: any) => m?.member_code && !delSet.has(m.member_code)).length
+        }
+      }
+    }
+  } catch {}
+  return INITIAL_MEMBERS.length
+}
+
 // ==========================================
 // STORE INTERFACES & METHODS
 // ==========================================
@@ -299,10 +380,12 @@ const store = global.__ISSAC_FINANCE_STORE__
 export class FinancialStore {
   // Campaigns
   static async getCampaigns(): Promise<FundCampaign[]> {
+    await ensureFinanceStoreLoaded()
     return [...store.campaigns]
   }
 
   static async getCampaignBySlug(slug: string): Promise<FundCampaign | null> {
+    await ensureFinanceStoreLoaded()
     const found = store.campaigns.find((c) => c.slug === slug || c.id === slug)
     return found ? { ...found } : null
   }
@@ -310,6 +393,7 @@ export class FinancialStore {
   static async createCampaign(
     campaign: Omit<FundCampaign, 'id' | 'createdAt' | 'updatedAt'>
   ): Promise<FundCampaign> {
+    await ensureFinanceStoreLoaded()
     const newCamp: FundCampaign = {
       ...campaign,
       id: `camp-${Date.now()}`,
@@ -326,15 +410,18 @@ export class FinancialStore {
       details: `Tạo chiến dịch: ${newCamp.title} - Mức thu: ${newCamp.defaultAmount.toLocaleString('vi-VN')}đ`,
     })
 
+    await persistFinanceStore()
     return newCamp
   }
 
   // Payment Intents
   static async getPaymentIntents(): Promise<PaymentIntent[]> {
+    await ensureFinanceStoreLoaded()
     return [...store.intents]
   }
 
   static async getPaymentIntentByCode(paymentCode: string): Promise<PaymentIntent | null> {
+    await ensureFinanceStoreLoaded()
     const upper = paymentCode.toUpperCase().trim()
     const found = store.intents.find((p) => p.paymentCode.toUpperCase() === upper)
     return found ? { ...found } : null
@@ -344,6 +431,7 @@ export class FinancialStore {
     campaignId: string,
     studentId: string
   ): Promise<PaymentIntent | null> {
+    await ensureFinanceStoreLoaded()
     const now = new Date().toISOString()
     const found = store.intents.find(
       (p) =>
@@ -359,6 +447,7 @@ export class FinancialStore {
     campaignId: string,
     studentId: string
   ): Promise<PaymentIntent | null> {
+    await ensureFinanceStoreLoaded()
     const found = store.intents.find(
       (p) =>
         (p.campaignId === campaignId || p.campaignSlug === campaignId) &&
@@ -369,17 +458,20 @@ export class FinancialStore {
   }
 
   static async savePaymentIntent(intent: PaymentIntent): Promise<PaymentIntent> {
+    await ensureFinanceStoreLoaded()
     const idx = store.intents.findIndex((p) => p.id === intent.id)
     if (idx >= 0) {
       store.intents[idx] = { ...intent, updatedAt: new Date().toISOString() }
     } else {
       store.intents.push({ ...intent, updatedAt: new Date().toISOString() })
     }
+    await persistFinanceStore()
     return intent
   }
 
   // Append-only Ledger
   static async getLedgerEntries(): Promise<FinancialLedgerEntry[]> {
+    await ensureFinanceStoreLoaded()
     return [...store.ledger]
   }
 
@@ -390,6 +482,7 @@ export class FinancialStore {
   static async addLedgerEntry(
     rawEntry: Omit<FinancialLedgerEntry, 'id' | 'entryNumber' | 'previousHash' | 'currentHash'>
   ): Promise<FinancialLedgerEntry> {
+    await ensureFinanceStoreLoaded()
     const nextEntryNumber = store.ledger.length + 1
     const nextId = `BT-${String(127 + nextEntryNumber).padStart(5, '0')}`
 
@@ -420,6 +513,7 @@ export class FinancialStore {
       details: `${rawEntry.type}: ${rawEntry.amount.toLocaleString('vi-VN')}đ - ${rawEntry.description} (Hash: ${currentHash.slice(0, 10)}...)`,
     })
 
+    await persistFinanceStore()
     return fullEntry
   }
 
@@ -434,6 +528,7 @@ export class FinancialStore {
     category: LedgerCategory
     actor: string
   }): Promise<FinancialLedgerEntry> {
+    await ensureFinanceStoreLoaded()
     const refEntry = store.ledger.find((e) => e.id === params.referenceEntryId)
     if (!refEntry) {
       throw new Error(`Bút toán gốc ${params.referenceEntryId} không tồn tại để điều chỉnh.`)
@@ -456,12 +551,14 @@ export class FinancialStore {
 
   // Expense Management
   static async getExpenses(): Promise<ExpenseRequest[]> {
+    await ensureFinanceStoreLoaded()
     return [...store.expenses]
   }
 
   static async createExpenseRequest(
     data: Omit<ExpenseRequest, 'id' | 'status' | 'createdAt'>
   ): Promise<ExpenseRequest> {
+    await ensureFinanceStoreLoaded()
     const newExpense: ExpenseRequest = {
       ...data,
       id: `EXP-2026-${String(store.expenses.length + 1).padStart(3, '0')}`,
@@ -478,6 +575,7 @@ export class FinancialStore {
       details: `Đề xuất chi ${data.amount.toLocaleString('vi-VN')}đ cho ${data.recipient}: ${data.reason}`,
     })
 
+    await persistFinanceStore()
     return newExpense
   }
 
@@ -490,6 +588,7 @@ export class FinancialStore {
     approverName: string
     approverRole: string
   }): Promise<ExpenseRequest> {
+    await ensureFinanceStoreLoaded()
     const expense = store.expenses.find((e) => e.id === params.expenseId)
     if (!expense) {
       throw new Error(`Đề xuất chi ${params.expenseId} không tồn tại.`)
@@ -526,6 +625,7 @@ export class FinancialStore {
 
     expense.ledgerEntryId = ledgerEntry.id
 
+    await persistFinanceStore()
     return expense
   }
 
@@ -536,6 +636,7 @@ export class FinancialStore {
     approverRole: string
     reason: string
   }): Promise<ExpenseRequest> {
+    await ensureFinanceStoreLoaded()
     const expense = store.expenses.find((e) => e.id === params.expenseId)
     if (!expense) {
       throw new Error(`Đề xuất chi ${params.expenseId} không tồn tại.`)
@@ -555,11 +656,13 @@ export class FinancialStore {
       details: `Từ chối đề xuất chi ${expense.id}: ${params.reason}`,
     })
 
+    await persistFinanceStore()
     return expense
   }
 
   // Audit Logs
   static async getAuditLogs(): Promise<FinancialAuditLog[]> {
+    await ensureFinanceStoreLoaded()
     return [...store.auditLogs]
   }
 
@@ -594,11 +697,13 @@ export class FinancialStore {
     }
 
     store.auditLogs.push(fullLog)
+    void persistFinanceStore()
     return fullLog
   }
 
   // Dashboard Stats
   static async getDashboardStats(): Promise<FinancialDashboardStats> {
+    await ensureFinanceStoreLoaded()
     let totalIncome = 0
     let totalExpense = 0
 
@@ -615,9 +720,9 @@ export class FinancialStore {
 
     const balance = totalIncome - totalExpense
 
+    const totalMemberCount = await getActiveClubMemberCount()
     const paidMembersCount = store.intents.filter((p) => p.status === 'success').length
-    const pendingReconciliationCount =
-      store.intents.filter((p) => p.status === 'disputed').length + 2 // Matching mockup 2 pending items
+    const pendingReconciliationCount = store.intents.filter((p) => p.status === 'disputed').length
     const activeCampaignsCount = store.campaigns.filter((c) => c.status === 'active').length
 
     return {
@@ -626,7 +731,7 @@ export class FinancialStore {
       balance,
       totalTransactions: store.ledger.length,
       paidMembersCount,
-      unpaidMembersCount: Math.max(0, 47 - paidMembersCount),
+      unpaidMembersCount: Math.max(0, totalMemberCount - paidMembersCount),
       pendingReconciliationCount,
       activeCampaignsCount,
     }
@@ -640,6 +745,7 @@ export class FinancialStore {
     firstHash: string
     reason?: string
   }> {
+    await ensureFinanceStoreLoaded()
     const result = verifyLedgerIntegrity(store.ledger)
     return {
       valid: result.valid,

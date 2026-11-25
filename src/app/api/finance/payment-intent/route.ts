@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { generatePaymentCode, generateVietQrUrl, getSePayConfig } from '@/lib/finance/sepay'
 import { FinancialStore } from '@/lib/finance/store'
-import { verifyClubMemberIdentity } from '@/lib/finance/verifyMember'
+import { verifyClubMemberIdentityWithCloud } from '@/lib/finance/verifyMember'
 import type { PaymentIntent } from '@/types/finance'
 
 export async function POST(request: Request) {
@@ -24,8 +24,13 @@ export async function POST(request: Request) {
       )
     }
 
-    // Re-verify member details
-    const verification = verifyClubMemberIdentity({ fullName, studentId, email, phone })
+    // Re-verify member details against live cloud roster + initial roster
+    const verification = await verifyClubMemberIdentityWithCloud({
+      fullName,
+      studentId,
+      email,
+      phone,
+    })
     if (!verification.isValid || !verification.member) {
       return NextResponse.json(
         { success: false, error: verification.errorMessage },

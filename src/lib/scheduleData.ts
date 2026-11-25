@@ -95,7 +95,7 @@ export const INITIAL_ACTIVITIES: ActivityItem[] = [
     session: 'afternoon',
     period: 'Tiết: 7 - 9',
     time: '13:30 - 16:30',
-    lead: 'Trần Đức Thắng (Trưởng ban TT)',
+    lead: 'Lê Trần Thuỷ Nguyên (Ban Truyền thông)',
     room: 'Phòng 514, số 1 Phan Tây Nhạc',
     category: 'training',
     categoryLabel: 'Workshop Training',

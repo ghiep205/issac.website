@@ -113,7 +113,7 @@ export function AccountsView() {
       setNewRole(
         m.department_slug === 'bcn'
           ? 'bcn'
-          : m.department_slug === 'nhan-su' && m.position.includes('Trưởng')
+          : m.department_slug === 'nhan-su' && (m.position.includes('Trưởng') || m.position.includes('Phó'))
           ? 'hr'
           : m.position.includes('Trưởng') || m.position.includes('Phó')
           ? 'dept_head'

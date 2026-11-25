@@ -455,20 +455,41 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
   const disputesRef = useRef<DisputeItem[]>(disputes)
   disputesRef.current = disputes
 
+  const lastSyncFailedRef = useRef(false)
+
+  const computeUpdatedPeriodScores = (
+    periodId: string,
+    proposalsList: ProposalItem[],
+    currentScores: Record<string, Record<string, number>>
+  ): Record<string, Record<string, number>> => {
+    const periodMap: Record<string, number> = {}
+    for (const p of proposalsList) {
+      const pPeriod = p.periodId || 'month-2026-10'
+      if (p.status === 'approved' && pPeriod === periodId && p.memberCode && p.memberCode !== 'ALL-CLUB') {
+        periodMap[p.memberCode] = (periodMap[p.memberCode] || 0) + Number(p.points || 0)
+      }
+    }
+    return {
+      ...currentScores,
+      [periodId]: periodMap,
+    }
+  }
+
   // Đổi chu kỳ hoạt động và đồng bộ lập tức đa nền tảng
   const setCurrentActivePeriodId = (newId: string) => {
     _setCurrentActivePeriodId(newId)
     currentActivePeriodIdRef.current = newId
-    const target = periods.find((p) => p.id === newId)
+    const currentPeriods = periodsRef.current.length > 0 ? periodsRef.current : periods
+    const target = currentPeriods.find((p) => p.id === newId)
     if (target?.name) {
       setCurrentActiveMonth(target.name)
     }
-    const updated = periods.map((p) => ({
+    const updated = currentPeriods.map((p) => ({
       ...p,
       isCurrent: p.id === newId,
     }))
-    setPeriods(updated)
     periodsRef.current = updated
+    setPeriods(updated)
 
     const recalculated = reconcileMemberScores(membersRef.current, proposalsRef.current, newId)
     membersRef.current = recalculated
@@ -714,7 +735,6 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
   }
 
   // Đồng bộ đám mây Supabase (PC <-> Điện thoại) - Nhận dữ liệu một chiều chống lặp vòng lặp mạng
-  let lastSyncFailed = false
   const fetchCloudSync = async (): Promise<void> => {
     try {
       const res = await fetch('/api/db/sync', {
@@ -725,10 +745,10 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         },
       })
       if (!res.ok) {
-        lastSyncFailed = true
+        lastSyncFailedRef.current = true
         return
       }
-      lastSyncFailed = false
+      lastSyncFailedRef.current = false
       const data = await res.json()
 
         // 1. Đồng bộ danh sách ID đề xuất đã xóa
@@ -1034,8 +1054,19 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
             surveyCustomQuestions: data.surveyCustomQuestions,
           })
         }
+        if (data.bcnSurveyNotes && typeof data.bcnSurveyNotes === 'object') {
+          try {
+            const currentNotesRaw = localStorage.getItem('issac_bcn_survey_notes_v1')
+            const currentNotes = currentNotesRaw ? JSON.parse(currentNotesRaw) : {}
+            const mergedNotes = { ...currentNotes, ...data.bcnSurveyNotes }
+            if (JSON.stringify(mergedNotes) !== JSON.stringify(currentNotes)) {
+              localStorage.setItem('issac_bcn_survey_notes_v1', JSON.stringify(mergedNotes))
+              window.dispatchEvent(new Event('storage'))
+            }
+          } catch {}
+        }
       } catch (err) {
-        lastSyncFailed = true
+        lastSyncFailedRef.current = true
       }
   }
 
@@ -1060,7 +1091,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       isFetching = true
       try {
         await fetchCloudSync()
-        if (lastSyncFailed) {
+        if (lastSyncFailedRef.current) {
           backoffUntil = Date.now() + 30000
         }
       } finally {
@@ -1289,8 +1320,18 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     }
 
     const deptInfo = deptSlugMap[data.departmentCode]
-    const nextStt = members.length + 1
-    const generatedCode = data.studentId ? data.studentId.trim() : `STAFF-00${nextStt}`
+    const baseList = membersRef.current.length > 0 ? membersRef.current : members
+    const maxStt = baseList.reduce((max, m) => Math.max(max, m.source_stt || 0), 0)
+    const nextStt = Math.max(maxStt + 1, baseList.length + 1)
+
+    let generatedCode = data.studentId ? data.studentId.trim() : `STAFF-${String(nextStt).padStart(3, '0')}`
+    if (!data.studentId) {
+      let candidateNum = nextStt
+      while (baseList.some((m) => m.member_code === generatedCode)) {
+        candidateNum++
+        generatedCode = `STAFF-${String(candidateNum).padStart(3, '0')}`
+      }
+    }
     const nowIso = new Date().toISOString()
 
     const cleanAvatar = sanitizeMemberAvatar(data.avatarUrl?.trim())
@@ -1393,11 +1434,16 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    let updatedCustomPeriodScores = customPeriodScoresRef.current
     if (proposalsChanged) {
       proposalsRef.current = updatedProps
       setProposals(updatedProps)
+      updatedCustomPeriodScores = computeUpdatedPeriodScores(targetPeriodId, updatedProps, customPeriodScoresRef.current)
+      customPeriodScoresRef.current = updatedCustomPeriodScores
+      setCustomPeriodScores(updatedCustomPeriodScores)
       try {
         localStorage.setItem('issac_proposals_clean_v1', JSON.stringify(updatedProps))
+        localStorage.setItem('issac_custom_period_scores', JSON.stringify(updatedCustomPeriodScores))
       } catch (e) {}
     }
 
@@ -1437,6 +1483,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     syncToCloud({
       members: reRanked,
       proposals: proposalsChanged ? updatedProps : undefined,
+      customPeriodScores: proposalsChanged ? updatedCustomPeriodScores : undefined,
       deletedMemberCodes: Array.from(deletedMemberCodesRef.current),
     })
 
@@ -1487,33 +1534,27 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     directApply?: boolean
     periodId?: string
   }) => {
-    const target = members.find((m) => m.member_code === data.memberCode)
+    const activeMembers = membersRef.current.length > 0 ? membersRef.current : members
+    const target = activeMembers.find((m) => m.member_code === data.memberCode)
     if (!target) return { success: false, message: 'Không tìm thấy thành viên' }
 
-    // KIỂM TRA PHÂN QUYỀN CHO ĐIỂM THEO BAN:
-    // 1. Ban Truyền thông (B01): Chỉ cho điểm thành viên Ban Truyền thông
-    if (data.proposerDepartmentCode === 'B01') {
-      if (target.department_code !== 'B01' && target.department_slug !== 'truyen-thong') {
-        return {
-          success: false,
-          message: 'Cán bộ Ban Truyền thông chỉ có quyền cho điểm thành viên thuộc Ban Truyền thông!',
-        }
+    // KIỂM TRA PHÂN QUYỀN CHO ĐIỂM THEO BAN (Đồng bộ với permissions.ts):
+    // Chỉ Ban Chủ nhiệm (B04 / bcn) và Ban Nhân sự (B03 / hr) mới có quyền cho/đề xuất điểm.
+    if (
+      (data.proposerDepartmentCode === 'B01' || data.proposerDepartmentCode === 'B02') &&
+      data.proposerRole !== 'bcn' &&
+      data.proposerRole !== 'hr'
+    ) {
+      return {
+        success: false,
+        message: 'Cán bộ Ban Truyền thông và Ban Tư vấn không có quyền cho điểm theo quy chế, chỉ có thể gửi khiếu nại Q06!',
       }
     }
-    // 2. Ban Tư vấn (B02): Chỉ cho điểm thành viên Ban Tư vấn
-    if (data.proposerDepartmentCode === 'B02') {
-      if (target.department_code !== 'B02' && target.department_slug !== 'tu-van') {
-        return {
-          success: false,
-          message: 'Cán bộ Ban Tư vấn chỉ có quyền cho điểm thành viên thuộc Ban Tư vấn!',
-        }
-      }
-    }
-    // 3. Ban Nhân sự (B03) & Ban Chủ nhiệm (B04): Có quyền cho điểm mọi người tất cả các ban
 
     // Xác định chu kỳ mục tiêu
-    const targetPeriodId = data.periodId || currentActivePeriodId
-    const targetPeriod = periods.find((p) => p.id === targetPeriodId) || periods[0]
+    const activePeriods = periodsRef.current.length > 0 ? periodsRef.current : periods
+    const targetPeriodId = data.periodId || currentActivePeriodIdRef.current || currentActivePeriodId
+    const targetPeriod = activePeriods.find((p) => p.id === targetPeriodId) || activePeriods[0]
 
     // KIỂM TRA KHÓA SỔ: Nếu chu kỳ đã được BCN khóa sổ thì KHÔNG cho phép chấm điểm!
     if (targetPeriod.status === 'locked') {
@@ -1523,17 +1564,32 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    const activeCustomRules = customRulesRef.current.length > 0 ? customRulesRef.current : customRules
     const builtinRule = CRITERIA_RULES[data.criterionCode as RuleCode]
-    const customRule = customRules.find((r) => r.code === data.criterionCode)
+    const customRule = activeCustomRules.find((r) => r.code === data.criterionCode)
+
+    const isCurrentActivePeriod =
+      targetPeriodId === currentActivePeriodIdRef.current || Boolean(targetPeriod?.isCurrent)
+    const targetPeriodDelta = proposalsRef.current
+      .filter(
+        (p) =>
+          p.status === 'approved' &&
+          p.memberCode === target.member_code &&
+          (p.periodId || 'month-2026-10') === targetPeriodId
+      )
+      .reduce((sum, p) => sum + Number(p.points || 0), 0)
+    const targetScoreInPeriod = isCurrentActivePeriod
+      ? target.current_score
+      : Math.max(0, Math.min(100, 60 + targetPeriodDelta))
 
     let ruleName = data.criterionCode
     let actualDelta = 0
-    let scoreAfter = target.current_score
+    let scoreAfter = targetScoreInPeriod
 
     // ĐIỂM TỰ CHO (Tùy chỉnh số điểm không bắt buộc theo mặc định)
     if (typeof data.customPoints === 'number' && !isNaN(data.customPoints)) {
       actualDelta = data.customPoints
-      scoreAfter = Math.max(0, Math.min(100, target.current_score + actualDelta))
+      scoreAfter = Math.max(0, Math.min(100, targetScoreInPeriod + actualDelta))
       if (builtinRule) {
         ruleName = `${builtinRule.name} (Tự cho: ${actualDelta > 0 ? `+${actualDelta}` : actualDelta}đ)`
       } else if (customRule) {
@@ -1547,7 +1603,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         ruleCode: data.criterionCode as RuleCode,
         basePoints: builtinRule.base_points,
         isCoreAtEvent: target.is_core,
-        currentScore: target.current_score,
+        currentScore: targetScoreInPeriod,
       })
       actualDelta = calc.actualDelta
       scoreAfter = calc.scoreAfter
@@ -1560,8 +1616,8 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       const isCoreMultiplier = !!customRule.coreMultiplierApplies && basePts < 0
       const multiplier = target.is_core && isCoreMultiplier ? 2 : 1
       const nominal = basePts * multiplier
-      scoreAfter = Math.max(0, Math.min(100, target.current_score + nominal))
-      actualDelta = scoreAfter - target.current_score
+      scoreAfter = Math.max(0, Math.min(100, targetScoreInPeriod + nominal))
+      actualDelta = scoreAfter - targetScoreInPeriod
     }
 
     // Nếu Ban Chủ nhiệm chọn áp dụng trực tiếp:
@@ -1599,27 +1655,25 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         setMembers(updatedMembers)
       }
 
-      // 2. Ghi nhận delta vào sổ cái customPeriodScores cho chu kỳ này
-      setCustomPeriodScores((prev) => {
-        const periodMap = prev[targetPeriodId] || {}
-        const curDelta = periodMap[target.member_code] || 0
-        return {
-          ...prev,
-          [targetPeriodId]: {
-            ...periodMap,
-            [target.member_code]: curDelta + actualDelta,
-          },
-        }
-      })
+      // 2. Ghi nhận delta chuẩn hóa từ sổ cái vào customPeriodScores cho chu kỳ này
+      const updatedScores = computeUpdatedPeriodScores(
+        targetPeriodId,
+        updatedProps,
+        customPeriodScoresRef.current
+      )
+      customPeriodScoresRef.current = updatedScores
+      setCustomPeriodScores(updatedScores)
 
       try {
         localStorage.setItem('issac_proposals_clean_v1', JSON.stringify(updatedProps))
+        localStorage.setItem('issac_custom_period_scores', JSON.stringify(updatedScores))
         if (isCurrentActive) {
           localStorage.setItem('issac_members_clean_v1', JSON.stringify(updatedMembers))
         }
       } catch (e) {}
       syncToCloud({
         proposals: updatedProps,
+        customPeriodScores: updatedScores,
         ...(isCurrentActive ? { members: updatedMembers } : {}),
       })
 
@@ -1700,26 +1754,25 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       setMembers(updatedMembers)
     }
 
-    // Ghi nhận delta vào customPeriodScores cho chu kỳ này
-    setCustomPeriodScores((prev) => {
-      const periodMap = prev[targetPeriodId] || {}
-      const curDelta = periodMap[prop.memberCode] || 0
-      return {
-        ...prev,
-        [targetPeriodId]: {
-          ...periodMap,
-          [prop.memberCode]: curDelta + prop.points,
-        },
-      }
-    })
+    // Ghi nhận delta chuẩn hóa vào customPeriodScores cho chu kỳ này
+    const updatedScores = computeUpdatedPeriodScores(
+      targetPeriodId,
+      updatedProps,
+      customPeriodScoresRef.current
+    )
+    customPeriodScoresRef.current = updatedScores
+    setCustomPeriodScores(updatedScores)
+
     try {
       localStorage.setItem('issac_proposals_clean_v1', JSON.stringify(updatedProps))
+      localStorage.setItem('issac_custom_period_scores', JSON.stringify(updatedScores))
       if (isCurrentActive) {
         localStorage.setItem('issac_members_clean_v1', JSON.stringify(updatedMembers))
       }
     } catch (e) {}
     syncToCloud({
       proposals: updatedProps,
+      customPeriodScores: updatedScores,
       ...(isCurrentActive ? { members: updatedMembers } : {}),
     })
   }
@@ -1793,21 +1846,21 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     }
 
     // Cập nhật period scores delta nếu có
-    if (prop.status === 'approved' && delta !== 0) {
-      setCustomPeriodScores((prev) => {
-        const periodMap = prev[targetPeriodId] || {}
-        const curDelta = periodMap[prop.memberCode] || 0
-        return {
-          ...prev,
-          [targetPeriodId]: {
-            ...periodMap,
-            [prop.memberCode]: curDelta + delta,
-          },
-        }
-      })
+    let updatedScores = customPeriodScoresRef.current
+    if (prop.status === 'approved') {
+      updatedScores = computeUpdatedPeriodScores(
+        targetPeriodId,
+        updatedProps,
+        customPeriodScoresRef.current
+      )
+      customPeriodScoresRef.current = updatedScores
+      setCustomPeriodScores(updatedScores)
     }
     try {
       localStorage.setItem('issac_proposals_clean_v1', JSON.stringify(updatedProps))
+      if (prop.status === 'approved') {
+        localStorage.setItem('issac_custom_period_scores', JSON.stringify(updatedScores))
+      }
       if (isCurrentActive) {
         localStorage.setItem('issac_members_clean_v1', JSON.stringify(updatedMembers))
       }
@@ -1815,6 +1868,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
 
     syncToCloud({
       proposals: updatedProps,
+      ...(prop.status === 'approved' ? { customPeriodScores: updatedScores } : {}),
       ...(isCurrentActive ? { members: updatedMembers } : {}),
     })
 
@@ -1852,23 +1906,23 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     }
 
     // Hoàn tác trong customPeriodScores
+    let updatedScores = customPeriodScoresRef.current
     if (prop.status === 'approved') {
-      setCustomPeriodScores((prev) => {
-        const periodMap = prev[targetPeriodId] || {}
-        const curDelta = periodMap[prop.memberCode] || 0
-        return {
-          ...prev,
-          [targetPeriodId]: {
-            ...periodMap,
-            [prop.memberCode]: curDelta - prop.points,
-          },
-        }
-      })
+      updatedScores = computeUpdatedPeriodScores(
+        targetPeriodId,
+        updatedProps,
+        customPeriodScoresRef.current
+      )
+      customPeriodScoresRef.current = updatedScores
+      setCustomPeriodScores(updatedScores)
     }
 
     deletedProposalIdsRef.current.add(proposalId)
     try {
       localStorage.setItem('issac_proposals_clean_v1', JSON.stringify(updatedProps))
+      if (prop.status === 'approved') {
+        localStorage.setItem('issac_custom_period_scores', JSON.stringify(updatedScores))
+      }
       localStorage.setItem(
         'issac_deleted_proposal_ids',
         JSON.stringify(Array.from(deletedProposalIdsRef.current))
@@ -1883,6 +1937,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       proposalId,
       deletedProposalIds: Array.from(deletedProposalIdsRef.current),
       proposals: updatedProps,
+      ...(prop.status === 'approved' ? { customPeriodScores: updatedScores } : {}),
       ...(isCurrentActive ? { members: updatedMembers } : {}),
     })
 
@@ -1899,38 +1954,42 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     status: CheckinStatus,
     note?: string
   ) => {
-    setEvents((prev) =>
-      prev.map((evt) => {
-        if (evt.id !== eventId) return evt
+    const nowTime = new Date().toLocaleTimeString('vi-VN', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+    const baseEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const nextEvents = baseEvents.map((evt) => {
+      if (evt.id !== eventId) return evt
 
-        const existing = evt.records[memberCode] || { memberCode, status: 'unexcused' }
-        const updatedRecord: CheckinRecord = {
-          ...existing,
-          status,
-          note: note !== undefined ? note : existing.note,
-          checkinTime:
-            status === 'present_on_time' || status === 'late'
-              ? existing.checkinTime || '19:35'
-              : undefined,
-        }
+      const existing = evt.records[memberCode] || { memberCode, status: 'unexcused' }
+      const updatedRecord: CheckinRecord = {
+        ...existing,
+        status,
+        note: note !== undefined ? note : existing.note,
+        checkinTime:
+          status === 'present_on_time' || status === 'late'
+            ? existing.checkinTime || nowTime
+            : undefined,
+      }
 
-        return {
-          ...evt,
-          records: {
-            ...evt.records,
-            [memberCode]: updatedRecord,
-          },
-        }
-      })
-    )
+      return {
+        ...evt,
+        records: {
+          ...evt.records,
+          [memberCode]: updatedRecord,
+        },
+      }
+    })
 
-    if (typeof window !== 'undefined') {
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'checkin', eventId, memberCode, status, note }),
-      }).catch((e) => console.error('Cloud sync error on checkin:', e))
-    }
+    eventsRef.current = nextEvents
+    setEvents(nextEvents)
+    try {
+      localStorage.setItem('issac_events_clean_v1', JSON.stringify(nextEvents))
+    } catch (e) {}
+
+    syncToCloud({ action: 'checkin', eventId, memberCode, status, note })
   }
 
   // Thành viên tự check-in qua cổng Kiosk hoặc Mobile (Tích hợp cơ chế Chống Điểm Danh Hộ)
@@ -1941,12 +2000,14 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     phoneLastDigits?: string,
     mode?: 'personal' | 'kiosk'
   ): { success: boolean; message: string; status?: CheckinStatus } => {
-    const evt = events.find((e) => e.id === eventId)
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const currentMembers = membersRef.current.length > 0 ? membersRef.current : members
+    const evt = currentEvents.find((e) => e.id === eventId)
     if (!evt) return { success: false, message: 'Buổi họp không tồn tại!' }
     if (evt.isFinalized) {
       return { success: false, message: 'Buổi họp đã kết thúc và chốt sổ điểm danh!' }
     }
-    const member = members.find((m) => m.member_code === memberCode)
+    const member = currentMembers.find((m) => m.member_code === memberCode)
     if (!member) {
       return { success: false, message: 'Mã thành viên không tồn tại trong danh sách CLB!' }
     }
@@ -2012,9 +2073,19 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     eventId: string,
     finalizedByName: string
   ) => {
-    const evt = events.find((e) => e.id === eventId)
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const currentMembers = membersRef.current.length > 0 ? membersRef.current : members
+    const currentPeriods = periodsRef.current.length > 0 ? periodsRef.current : periods
+    const evt = currentEvents.find((e) => e.id === eventId)
     if (!evt) return { success: false, message: 'Buổi họp không tồn tại' }
     if (evt.isFinalized) return { success: false, message: 'Buổi họp này đã được chốt trước đó!' }
+
+    const targetPeriodId = evt.periodId || getEventPeriodId(evt) || currentActivePeriodIdRef.current || 'month-2026-11'
+    const targetPeriodName =
+      evt.periodName ||
+      currentPeriods.find((p) => p.id === targetPeriodId)?.name ||
+      currentActiveMonth ||
+      'Tháng 11/2026'
 
     let present = 0
     let late = 0
@@ -2026,7 +2097,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     const nowStr = getVietnamNowFormatted()
 
     // Duyệt qua từng thành viên để tính điểm chuẩn quy chế iSSAC
-    const updatedMembers = members.map((m) => {
+    const updatedMembers = currentMembers.map((m) => {
       const rec = evt.records[m.member_code] || {
         memberCode: m.member_code,
         status: 'unexcused',
@@ -2113,8 +2184,8 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
         proposedByRole: 'bcn',
         status: 'approved',
         createdAt: nowStr,
-        periodId: evt.periodId || currentActivePeriodId || 'month-2026-10',
-        periodName: currentActiveMonth || 'Tháng 10/2026',
+        periodId: targetPeriodId,
+        periodName: targetPeriodName,
       })
 
       const newT02Count = criterion === 'T02' ? m.absent_count_t02 + 1 : m.absent_count_t02
@@ -2126,11 +2197,6 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       }
     })
 
-    // Cập nhật danh sách thành viên với bảng xếp hạng mới
-    const rankedMembers = getRankedMembers(updatedMembers)
-    membersRef.current = rankedMembers
-    setMembers(rankedMembers)
-
     // Thêm các bản ghi mới vào sổ cái và deduplicate theo id
     const currentProps = proposalsRef.current
     const combinedProposals = [
@@ -2139,24 +2205,45 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
     ]
     proposalsRef.current = combinedProposals
     setProposals(combinedProposals)
+
+    // Cập nhật lại điểm xếp hạng dựa trên sổ cái đã chốt nếu là chu kỳ hiện tại
+    const isCurrentActivePeriod =
+      targetPeriodId === currentActivePeriodIdRef.current ||
+      Boolean(currentPeriods.find((p) => p.id === targetPeriodId)?.isCurrent)
+    const rankedMembers = isCurrentActivePeriod
+      ? reconcileMemberScores(updatedMembers, combinedProposals, targetPeriodId)
+      : getRankedMembers(updatedMembers)
+    membersRef.current = rankedMembers
+    setMembers(rankedMembers)
+
+    const updatedScores = computeUpdatedPeriodScores(
+      targetPeriodId,
+      combinedProposals,
+      customPeriodScoresRef.current
+    )
+    customPeriodScoresRef.current = updatedScores
+    setCustomPeriodScores(updatedScores)
+
+    // Đánh dấu buổi họp đã chốt
+    const nextEvents = currentEvents.map((e) =>
+      e.id === eventId
+        ? {
+            ...e,
+            isFinalized: true,
+            finalizedAt: getVietnamNowFormatted(),
+            finalizedBy: finalizedByName,
+          }
+        : e
+    )
+    eventsRef.current = nextEvents
+    setEvents(nextEvents)
+
     try {
       localStorage.setItem('issac_proposals_clean_v1', JSON.stringify(combinedProposals))
       localStorage.setItem('issac_members_clean_v1', JSON.stringify(rankedMembers))
+      localStorage.setItem('issac_custom_period_scores', JSON.stringify(updatedScores))
+      localStorage.setItem('issac_events_clean_v1', JSON.stringify(nextEvents))
     } catch (e) {}
-
-    // Đánh dấu buổi họp đã chốt
-    setEvents((prev) =>
-      prev.map((e) =>
-        e.id === eventId
-          ? {
-              ...e,
-              isFinalized: true,
-              finalizedAt: getVietnamNowFormatted(),
-              finalizedBy: finalizedByName,
-            }
-          : e
-      )
-    )
 
     const result = {
       success: true,
@@ -2170,19 +2257,14 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       },
     }
 
-    if (typeof window !== 'undefined') {
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'finalize',
-          eventId,
-          finalizedBy: finalizedByName,
-          proposals: combinedProposals,
-          members: getRankedMembers(updatedMembers),
-        }),
-      }).catch((e) => console.error('Cloud sync error on finalize:', e))
-    }
+    syncToCloud({
+      action: 'finalize',
+      eventId,
+      finalizedBy: finalizedByName,
+      proposals: combinedProposals,
+      customPeriodScores: updatedScores,
+      ...(isCurrentActivePeriod ? { members: rankedMembers } : {}),
+    })
 
     return result
   }
@@ -2423,32 +2505,38 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       } catch (e) {}
     }
 
-    // 1. Reset toàn bộ 47 thành viên về mốc xuất phát chuẩn 60 điểm cho chu kỳ mới
+    const currentMembers = membersRef.current.length > 0 ? membersRef.current : members
+    const currentPeriods = periodsRef.current.length > 0 ? periodsRef.current : periods
+    const currentProps = proposalsRef.current
+    const currentScores = customPeriodScoresRef.current
+
+    // 1. Reset toàn bộ thành viên về mốc xuất phát chuẩn 60 điểm cho chu kỳ mới
     const resetMembers = getRankedMembers(
-      members.map((m) => ({
+      currentMembers.map((m) => ({
         ...m,
         current_score: 60,
         absent_count_t02: 0,
         delta_rank: 0,
       }))
     )
+    membersRef.current = resetMembers
     setMembers(resetMembers)
 
     // 2. Cập nhật danh sách chu kỳ (nếu đã có thì kích hoạt lại, chưa có thì tạo mới)
-    const existingIndex = periods.findIndex((p) => p.id === targetId)
+    const existingIndex = currentPeriods.findIndex((p) => p.id === targetId)
     let activeItem: PeriodItem
     let updatedPeriods: PeriodItem[]
 
     if (existingIndex >= 0) {
       activeItem = {
-        ...periods[existingIndex],
+        ...currentPeriods[existingIndex],
         name: periodName,
         status: 'active',
         isCurrent: true,
         isFinalized: false,
-        description: data.description?.trim() || periods[existingIndex].description,
+        description: data.description?.trim() || currentPeriods[existingIndex].description,
       }
-      updatedPeriods = periods.map((p, idx) => {
+      updatedPeriods = currentPeriods.map((p, idx) => {
         if (idx === existingIndex) return activeItem
         if (p.scope === 'month') return { ...p, isCurrent: false }
         return p
@@ -2464,18 +2552,21 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       activeItem.isCurrent = true
       updatedPeriods = [
         activeItem,
-        ...periods.map((p) => (p.scope === 'month' ? { ...p, isCurrent: false } : p)),
+        ...currentPeriods.map((p) => (p.scope === 'month' ? { ...p, isCurrent: false } : p)),
       ]
     }
 
+    periodsRef.current = updatedPeriods
     setPeriods(updatedPeriods)
+    currentActivePeriodIdRef.current = activeItem.id
     _setCurrentActivePeriodId(activeItem.id)
     setCurrentActiveMonth(activeItem.name)
 
     const updatedPeriodScores = {
-      ...customPeriodScores,
+      ...currentScores,
       [activeItem.id]: {},
     }
+    customPeriodScoresRef.current = updatedPeriodScores
     setCustomPeriodScores(updatedPeriodScores)
 
     // Thêm bản ghi thông báo hệ thống
@@ -2496,7 +2587,8 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       status: 'approved',
       createdAt: getVietnamNowFormatted(),
     }
-    const updatedProps = [logItem, ...proposals]
+    const updatedProps = [logItem, ...currentProps]
+    proposalsRef.current = updatedProps
     setProposals(updatedProps)
 
     // 3. Lưu tức thì vào localStorage
@@ -2830,8 +2922,14 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
   }) => {
     const id = `evt-${Date.now()}`
     const generatedPin = data.pinCode?.trim() || String(Math.floor(1000 + Math.random() * 9000))
-    const targetPeriodId = data.periodId || getEventPeriodId({ date: data.date }) || currentActivePeriodId || 'month-2026-11'
-    const targetPeriod = periods.find((p) => p.id === targetPeriodId)
+    const activePeriods = periodsRef.current.length > 0 ? periodsRef.current : periods
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const targetPeriodId =
+      data.periodId ||
+      getEventPeriodId({ date: data.date }) ||
+      currentActivePeriodIdRef.current ||
+      'month-2026-11'
+    const targetPeriod = activePeriods.find((p) => p.id === targetPeriodId)
 
     const newEvt: MeetingEvent = {
       id,
@@ -2854,23 +2952,20 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       periodName: targetPeriod?.name || currentActiveMonth || 'Tháng 11/2026',
     }
 
-    const updated = [newEvt, ...events]
+    const updated = [newEvt, ...currentEvents]
+    eventsRef.current = updated
     setEvents(updated)
-    setActiveEventId(newEvt.id)
+    _setActiveEventId(newEvt.id)
 
     if (typeof window !== 'undefined') {
       try {
         localStorage.setItem('issac_events_clean_v1', JSON.stringify(updated))
+        localStorage.setItem('issac_active_event_id', newEvt.id)
       } catch (e) {
         console.error('Error saving events:', e)
       }
 
-      // Đẩy ngay lên Supabase Cloud API để điện thoại nhận được tức thì!
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'create_event', event: newEvt, events: updated }),
-      }).catch((e) => console.error('Cloud sync error on create_event:', e))
+      syncToCloud({ action: 'create_event', event: newEvt, events: updated, activeEventId: newEvt.id })
     }
 
     return {
@@ -2882,7 +2977,9 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
 
   // Thành viên đăng ký tham gia sự kiện
   const registerForEvent = (eventId: string, memberCode: string) => {
-    const target = events.find((e) => e.id === eventId)
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const currentMembers = membersRef.current.length > 0 ? membersRef.current : members
+    const target = currentEvents.find((e) => e.id === eventId)
     if (!target) return { success: false, message: 'Không tìm thấy sự kiện!' }
 
     const registered = target.registeredMemberCodes || []
@@ -2894,7 +2991,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       return { success: false, message: 'Sự kiện đã đạt số lượng đăng ký tối đa!' }
     }
 
-    const updated = events.map((e) => {
+    const updated = currentEvents.map((e) => {
       if (e.id === eventId) {
         return {
           ...e,
@@ -2904,6 +3001,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       return e
     })
 
+    eventsRef.current = updated
     setEvents(updated)
     if (typeof window !== 'undefined') {
       try {
@@ -2911,14 +3009,10 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         console.error(err)
       }
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'sync_all', events: updated }),
-      }).catch((e) => console.error('Cloud sync error on registerForEvent:', e))
+      syncToCloud({ action: 'register', eventId, memberCode, events: updated })
     }
 
-    const memberName = members.find((m) => m.member_code === memberCode)?.full_name || memberCode
+    const memberName = currentMembers.find((m) => m.member_code === memberCode)?.full_name || memberCode
     return {
       success: true,
       message: `Đăng ký thành công cho ${memberName}! Hãy chuẩn bị mã PIN ${target.pinCode} để điểm danh check-in.`,
@@ -2927,10 +3021,11 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
 
   // Hủy đăng ký tham gia sự kiện
   const unregisterFromEvent = (eventId: string, memberCode: string) => {
-    const target = events.find((e) => e.id === eventId)
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const target = currentEvents.find((e) => e.id === eventId)
     if (!target) return { success: false, message: 'Không tìm thấy sự kiện!' }
 
-    const updated = events.map((e) => {
+    const updated = currentEvents.map((e) => {
       if (e.id === eventId) {
         return {
           ...e,
@@ -2940,6 +3035,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       return e
     })
 
+    eventsRef.current = updated
     setEvents(updated)
     if (typeof window !== 'undefined') {
       try {
@@ -2947,11 +3043,7 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         console.error(err)
       }
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'unregister', eventId, memberCode, events: updated }),
-      }).catch((e) => console.error('Cloud sync error on unregisterFromEvent:', e))
+      syncToCloud({ action: 'unregister', eventId, memberCode, events: updated })
     }
 
     return {
@@ -2962,10 +3054,12 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
 
   // Cập nhật thông tin chi tiết sự kiện
   const updateEvent = (eventId: string, updates: Partial<MeetingEvent>) => {
-    const target = events.find((e) => e.id === eventId)
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const target = currentEvents.find((e) => e.id === eventId)
     if (!target) return { success: false, message: 'Không tìm thấy sự kiện cần chỉnh sửa!' }
 
-    const updated = events.map((e) => (e.id === eventId ? { ...e, ...updates } : e))
+    const updated = currentEvents.map((e) => (e.id === eventId ? { ...e, ...updates } : e))
+    eventsRef.current = updated
     setEvents(updated)
     if (typeof window !== 'undefined') {
       try {
@@ -2973,29 +3067,27 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         console.error(err)
       }
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'update_event',
-          eventId,
-          event: updates,
-          events: updated,
-        }),
-      }).catch((e) => console.error('Cloud sync error on updateEvent:', e))
+      syncToCloud({
+        action: 'update_event',
+        eventId,
+        event: updates,
+        events: updated,
+      })
     }
     return { success: true, message: 'Đã cập nhật thông tin sự kiện và đồng bộ tới toàn hệ thống.' }
   }
 
   // Cập nhật danh sách thành viên đăng ký theo danh sách CLB
   const updateEventAttendees = (eventId: string, memberCodes: string[]) => {
-    const target = events.find((e) => e.id === eventId)
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const target = currentEvents.find((e) => e.id === eventId)
     if (!target) return { success: false, message: 'Không tìm thấy sự kiện!' }
 
     const uniqueCodes = Array.from(new Set(memberCodes))
-    const updated = events.map((e) =>
+    const updated = currentEvents.map((e) =>
       e.id === eventId ? { ...e, registeredMemberCodes: uniqueCodes } : e
     )
+    eventsRef.current = updated
     setEvents(updated)
     if (typeof window !== 'undefined') {
       try {
@@ -3003,16 +3095,12 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         console.error(err)
       }
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'update_event_attendees',
-          eventId,
-          registeredMemberCodes: uniqueCodes,
-          events: updated,
-        }),
-      }).catch((e) => console.error('Cloud sync error on updateEventAttendees:', e))
+      syncToCloud({
+        action: 'update_event_attendees',
+        eventId,
+        registeredMemberCodes: uniqueCodes,
+        events: updated,
+      })
     }
     return {
       success: true,
@@ -3023,14 +3111,21 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
   // Xóa sự kiện
   const deleteEvent = (eventId: string) => {
     deletedEventIdsRef.current.add(eventId)
-    const updated = events.filter((e) => e.id !== eventId)
+    const currentEvents = eventsRef.current.length > 0 ? eventsRef.current : events
+    const updated = currentEvents.filter((e) => e.id !== eventId)
+    eventsRef.current = updated
     setEvents(updated)
+    const nextActiveId = activeEventId === eventId ? (updated.length > 0 ? updated[0].id : '') : activeEventId
     if (activeEventId === eventId) {
-      setActiveEventId(updated.length > 0 ? updated[0].id : '')
+      _setActiveEventId(nextActiveId)
     }
     if (typeof window !== 'undefined') {
       try {
         localStorage.setItem('issac_events_clean_v1', JSON.stringify(updated))
+        if (activeEventId === eventId) {
+          if (nextActiveId) localStorage.setItem('issac_active_event_id', nextActiveId)
+          else localStorage.removeItem('issac_active_event_id')
+        }
         localStorage.setItem(
           'issac_deleted_event_ids',
           JSON.stringify(Array.from(deletedEventIdsRef.current))
@@ -3038,16 +3133,12 @@ export function ClubProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         console.error(err)
       }
-      fetch('/api/db/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'delete_event',
-          eventId,
-          events: updated,
-          deletedEventIds: Array.from(deletedEventIdsRef.current),
-        }),
-      }).catch((e) => console.error('Cloud sync error on deleteEvent:', e))
+      syncToCloud({
+        action: 'delete_event',
+        eventId,
+        activeEventId: nextActiveId,
+        deletedEventIds: Array.from(deletedEventIdsRef.current),
+      })
     }
     return { success: true, message: 'Đã xóa sự kiện khỏi hệ thống và đồng bộ tới tất cả thiết bị.' }
   }

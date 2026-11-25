@@ -1,7 +1,7 @@
 
 'use client'
 
-import React, { useState, useMemo, useEffect, useCallback } from 'react'
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import {
   Calendar as CalendarIcon,
   Clock,
@@ -141,21 +141,25 @@ export function formatDisplayDate(dateStr?: string): string {
   return dateStr
 }
 
-// Chuẩn hóa 1 Time duy nhất (chung 1 ngày, không có ngày bắt đầu / kết thúc tách rời) và chuẩn Quý CLB iSSAC
+// Chuẩn hóa ngày hiển thị & Quý CLB iSSAC (không ghi đè cứng ngày đã chỉnh sửa)
 export function normalizeActivity(item: ActivityItem): ActivityItem {
   const correctedQuarter = getClubQuarter(item.date, item.month)
   const base: ActivityItem = { ...item, quarter: correctedQuarter, endDate: undefined }
 
-  if (item.id === 'act-01-recruitment') {
-    return { ...base, date: '2026-09-18', timeStart: '18/09', timeEnd: '18/09' }
-  }
-  if (item.id === 'act-02-first-meeting') {
-    return { ...base, date: '2026-10-22', timeStart: '22/10', timeEnd: '22/10' }
-  }
-  if (item.id === 'act-09-conference') {
-    return { ...base, date: '2026-11-26', timeStart: '26/11', timeEnd: '26/11' }
-  }
   if (item.date) {
+    const match = item.date.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/)
+    if (match) {
+      const monthNum = parseInt(match[2], 10)
+      const day = match[3].padStart(2, '0')
+      const month = String(monthNum).padStart(2, '0')
+      return {
+        ...base,
+        month: item.month || `Tháng ${monthNum}/${match[1]}`,
+        dayOfWeek: new Date(parseInt(match[1], 10), monthNum - 1, parseInt(match[3], 10)).getDay(),
+        timeStart: `${day}/${month}`,
+        timeEnd: `${day}/${month}`,
+      }
+    }
     const d = new Date(item.date)
     if (!isNaN(d.getTime())) {
       const day = String(d.getDate()).padStart(2, '0')
@@ -353,14 +357,38 @@ export function ScheduleView() {
   })
 
   // Hàm đồng bộ tức thì lên Supabase Cloud và phát tín hiệu cho toàn bộ ứng dụng
+  const deletedActivityIdsRef = useRef<Set<string>>((() => {
+    const s = new Set<string>()
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem('issac_deleted_activity_ids')
+        if (raw) {
+          const parsed = JSON.parse(raw)
+          if (Array.isArray(parsed)) parsed.forEach((id: string) => s.add(id))
+        }
+      } catch {}
+    }
+    return s
+  })())
+
   const syncScheduleToCloud = useCallback(
     async (payload: {
+      action?: string
+      activityId?: string
+      deletedActivityIds?: string[]
       activities?: ActivityItem[]
       schedulePendingRequests?: PendingScheduleRequest[]
     }) => {
       try {
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('issac_schedule_sync', { detail: payload }))
+          if (typeof BroadcastChannel !== 'undefined') {
+            try {
+              const bc = new BroadcastChannel('issac_realtime_bus')
+              bc.postMessage({ type: 'SYNC_TRIGGER' })
+              bc.close()
+            } catch {}
+          }
         }
         await fetch('/api/db/sync', {
           method: 'POST',
@@ -378,11 +406,21 @@ export function ScheduleView() {
   const fetchCloudSchedule = useCallback(async () => {
     try {
       const res = await fetch('/api/db/sync', {
+        cache: 'no-store',
         headers: { 'Cache-Control': 'no-cache' },
       })
       if (!res.ok) return
       const data = await res.json()
       if (data.success) {
+        if (Array.isArray(data.deletedActivityIds)) {
+          data.deletedActivityIds.forEach((id: string) => deletedActivityIdsRef.current.add(id))
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(
+              'issac_deleted_activity_ids',
+              JSON.stringify(Array.from(deletedActivityIdsRef.current))
+            )
+          }
+        }
         if (Array.isArray(data.schedulePendingRequests)) {
           setPendingRequests(data.schedulePendingRequests)
           if (typeof window !== 'undefined') {
@@ -392,10 +430,12 @@ export function ScheduleView() {
             )
           }
         }
-        if (Array.isArray(data.activities) && data.activities.length > 0) {
+        if (Array.isArray(data.activities)) {
           const cleaned = data.activities
             .filter(
               (item: ActivityItem) =>
+                item?.id &&
+                !deletedActivityIdsRef.current.has(item.id) &&
                 !item.code?.startsWith('INS') &&
                 item.id !== 'act-03-netsec' &&
                 item.id !== 'act-04-dsa' &&
@@ -463,18 +503,40 @@ export function ScheduleView() {
     const handleFocus = () => {
       fetchCloudSchedule()
     }
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        fetchCloudSchedule()
+      }
+    }
+
+    let broadcastChannel: BroadcastChannel | null = null
+    if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
+      try {
+        broadcastChannel = new BroadcastChannel('issac_realtime_bus')
+        broadcastChannel.onmessage = (event) => {
+          if (event.data?.type === 'SYNC_TRIGGER') {
+            fetchCloudSchedule()
+          }
+        }
+      } catch {}
+    }
 
     window.addEventListener('storage', handleStorageChange)
     window.addEventListener('issac_schedule_sync', handleCustomSync as EventListener)
     window.addEventListener('focus', handleFocus)
-    document.addEventListener('visibilitychange', handleFocus)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
 
     return () => {
       clearInterval(timer)
+      if (broadcastChannel) {
+        try {
+          broadcastChannel.close()
+        } catch {}
+      }
       window.removeEventListener('storage', handleStorageChange)
       window.removeEventListener('issac_schedule_sync', handleCustomSync as EventListener)
       window.removeEventListener('focus', handleFocus)
-      document.removeEventListener('visibilitychange', handleFocus)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
   }, [fetchCloudSchedule])
 
@@ -922,14 +984,22 @@ export function ScheduleView() {
     }
 
     if (window.confirm('Bạn có chắc chắn muốn xóa hoạt động này khỏi lịch CLB?')) {
+      deletedActivityIdsRef.current.add(id)
+      const deletedIdsArr = Array.from(deletedActivityIdsRef.current)
       const nextActivities = activities.filter((item) => item.id !== id)
       setActivities(nextActivities)
       setSelectedActivity(null)
       setIsEditingSelected(false)
       if (typeof window !== 'undefined') {
         localStorage.setItem('issac_activities_data', JSON.stringify(nextActivities))
+        localStorage.setItem('issac_deleted_activity_ids', JSON.stringify(deletedIdsArr))
       }
-      syncScheduleToCloud({ activities: nextActivities })
+      syncScheduleToCloud({
+        action: 'delete_activity',
+        activityId: id,
+        deletedActivityIds: deletedIdsArr,
+        activities: nextActivities,
+      })
       setSystemNotice({
         type: 'success',
         title: 'Đã xóa hoạt động',

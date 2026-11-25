@@ -300,6 +300,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     accounts?: IssuedAccount[]
     deletedAccountIds?: string[]
     deletedMemberCodes?: string[]
+    unblockAccountIdentities?: string[]
     action?: string
     accountId?: string
     studentId?: string
@@ -311,7 +312,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      }).catch((e) => console.error('Cloud account sync notice:', e))
+      })
+        .then((res) => {
+          if (res.ok && typeof BroadcastChannel !== 'undefined') {
+            try {
+              const bc = new BroadcastChannel('issac_realtime_bus')
+              bc.postMessage({ type: 'SYNC_TRIGGER' })
+              bc.close()
+            } catch {}
+          }
+        })
+        .catch((e) => console.error('Cloud account sync notice:', e))
     }
   }
 
@@ -408,6 +419,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             }
             return null
           }
+          if (!current && typeof window !== 'undefined') {
+            const saved = localStorage.getItem('issac_active_user')
+            if (saved && !isIdentityDeleted(saved) && Array.isArray(data.members)) {
+              const foundCloudMem = data.members.find(
+                (m: any) => (m.member_code === saved || m.student_id === saved) && !isEntityDeleted(m)
+              )
+              if (foundCloudMem) {
+                const roleInfo = getRoleForMember(foundCloudMem)
+                return {
+                  id: foundCloudMem.member_code,
+                  name: foundCloudMem.full_name,
+                  role: roleInfo.role,
+                  roleTitle: roleInfo.roleTitle,
+                  departmentCode: foundCloudMem.department_code,
+                  departmentName: foundCloudMem.department_name,
+                  memberCode: foundCloudMem.member_code,
+                  isCore: roleInfo.isCore,
+                  avatarBg: 'bg-blue-600',
+                  avatarUrl: foundCloudMem.avatar_url,
+                }
+              }
+            }
+          }
           return current
         })
     } catch (err) {
@@ -469,8 +503,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           return
         }
 
-        // 2. Check full roster (48 official members)
-        const foundMember = INITIAL_MEMBERS.find(
+        // 2. Check full roster (default + newly added/updated members cached locally)
+        let localRoster: RosterMember[] = cloudMembersRef.current
+        try {
+          const savedMembersStr = localStorage.getItem('issac_members_clean_v1')
+          if (savedMembersStr) {
+            const parsedMembers = JSON.parse(savedMembersStr)
+            if (Array.isArray(parsedMembers) && parsedMembers.length > 0) {
+              const memberMap = new Map<string, RosterMember>()
+              INITIAL_MEMBERS.forEach((m) => memberMap.set(m.member_code, m))
+              parsedMembers.forEach((m: RosterMember) => {
+                if (m?.member_code) memberMap.set(m.member_code, m)
+              })
+              localRoster = Array.from(memberMap.values())
+              cloudMembersRef.current = localRoster
+            }
+          }
+        } catch {}
+
+        const foundMember = localRoster.find(
           (m) => (m.member_code === saved || m.student_id === saved) && !isEntityDeleted(m)
         )
         if (foundMember) {
@@ -572,6 +623,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibility)
     }
+    let broadcastChannel: BroadcastChannel | null = null
+    if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
+      try {
+        broadcastChannel = new BroadcastChannel('issac_realtime_bus')
+        broadcastChannel.onmessage = (event) => {
+          if (event.data?.type === 'SYNC_TRIGGER') {
+            fetchCloudAccounts()
+          }
+        }
+      } catch {}
+    }
     if (typeof window !== 'undefined') {
       window.addEventListener('focus', handleFocus)
       window.addEventListener('storage', handleStorage)
@@ -590,6 +652,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const timer = setInterval(pollAccounts, 10000)
 
     return () => {
+      if (broadcastChannel) {
+        try {
+          broadcastChannel.close()
+        } catch {}
+      }
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibility)
       }
@@ -611,7 +678,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return
     }
 
-    const foundMember = INITIAL_MEMBERS.find(
+    const activeRoster = cloudMembersRef.current.length > 0 ? cloudMembersRef.current : INITIAL_MEMBERS
+    const foundMember = activeRoster.find(
       (m) => (m.member_code === userId || m.student_id === userId) && !isEntityDeleted(m)
     )
     if (foundMember) {
@@ -646,9 +714,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const newAcc: IssuedAccount = {
       ...data,
+      email: cleanEmail,
       id: `acc-${Date.now()}`,
       createdAt: new Date().toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),
     }
+
+    // Gỡ email/MSSV/họ tên của tài khoản mới tạo khỏi blacklist nếu người này từng bị xóa tài khoản trước đó
+    // (Vẫn giữ nguyên ID tài khoản cũ acc-... trong tombstone để khóa phiên cũ)
+    const unblockIdentities: string[] = [cleanEmail]
+    if (newAcc.studentId?.trim()) unblockIdentities.push(newAcc.studentId.trim())
+    if (newAcc.fullName?.trim()) unblockIdentities.push(newAcc.fullName.trim())
+    const unblockLower = new Set(unblockIdentities.map((v) => v.toLowerCase().trim()))
+
+    for (const delItem of Array.from(deletedAccountIdsRef.current)) {
+      if (unblockLower.has(delItem.toLowerCase().trim())) {
+        deletedAccountIdsRef.current.delete(delItem)
+      }
+    }
+    const updatedDelArr = Array.from(deletedAccountIdsRef.current)
+    try {
+      localStorage.setItem('issac_deleted_account_ids', JSON.stringify(updatedDelArr))
+    } catch {}
 
     const updated = [newAcc, ...issuedAccounts]
     setIssuedAccounts(updated)
@@ -658,7 +744,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       console.error(e)
     }
 
-    syncAccountsToCloud({ accounts: updated })
+    syncAccountsToCloud({
+      action: 'create_account',
+      accounts: updated,
+      unblockAccountIdentities: unblockIdentities,
+      deletedAccountIds: updatedDelArr,
+    })
 
     return { success: true, message: `Cấp tài khoản thành công cho cán bộ "${data.fullName}"!` }
   }
@@ -769,8 +860,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         m.member_code.toLowerCase() === clean ||
         (m.student_id && m.student_id.toLowerCase() === clean) ||
         m.email.toLowerCase() === clean ||
-        m.full_name.toLowerCase() === clean ||
-        m.full_name.toLowerCase().includes(clean)
+        m.full_name.toLowerCase() === clean
     )
 
     // 2. Tìm kiếm trong danh sách tài khoản được cấp (issuedAccounts)
@@ -784,8 +874,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             (a.studentId.toLowerCase() === member.student_id?.toLowerCase() ||
               a.studentId.toLowerCase() === member.member_code.toLowerCase())) ||
           (member && a.email && a.email.toLowerCase() === member.email.toLowerCase()) ||
-          a.fullName.toLowerCase() === clean ||
-          a.fullName.toLowerCase().includes(clean))
+          a.fullName.toLowerCase() === clean)
     )
 
     // 3. Tìm kiếm trong tài khoản cài sẵn (preset)
@@ -795,8 +884,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         (u.id.toLowerCase() === clean ||
           u.memberCode?.toLowerCase() === clean ||
           (member && u.memberCode?.toLowerCase() === member.member_code.toLowerCase()) ||
-          u.name.toLowerCase() === clean ||
-          u.name.toLowerCase().includes(clean))
+          u.name.toLowerCase() === clean)
     )
 
     // BƯỚC 2: KIỂM TRA THỰC THỂ TÌM THẤY CÓ BỊ XÓA KHÔNG

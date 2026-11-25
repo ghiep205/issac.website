@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { FinancialStore } from '@/lib/finance/store'
-import { verifyClubMemberIdentity } from '@/lib/finance/verifyMember'
+import { verifyClubMemberIdentityWithCloud } from '@/lib/finance/verifyMember'
 
 export async function POST(request: Request) {
   try {
@@ -30,9 +30,9 @@ export async function POST(request: Request) {
       )
     }
 
-    // 2. Strict 4-field member verification
+    // 2. Strict 4-field member verification (checks cloud-synced members + default roster)
     const clientIp = request.headers.get('x-forwarded-for') || 'local'
-    const verification = verifyClubMemberIdentity(
+    const verification = await verifyClubMemberIdentityWithCloud(
       { fullName, studentId, email, phone },
       clientIp
     )

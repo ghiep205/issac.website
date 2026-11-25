@@ -17,6 +17,7 @@ import { getVietnamNowFormatted } from '@/lib/vietnamTime'
 import { useClub } from '@/lib/context/ClubContext'
 import { useAuth } from '@/lib/auth/AuthContext'
 import { type RosterMember, getMemberAvatarUrl } from '@/lib/clubData'
+import { CRITERIA_RULES } from '@/lib/scoring/constants'
 
 export interface DisputeModalProps {
   isOpen: boolean
@@ -37,20 +38,22 @@ interface DeductCriterionOption {
 
 const CRITERIA_GROUPS: DeductCriterionOption[] = [
   // 1. Chuyên cần & Điểm danh
-  { code: 'T02', name: 'Vắng họp CLB không phép', points: -5, group: 'Chuyên cần & Điểm danh' },
-  { code: 'T04', name: 'Đi họp muộn quá 15 phút', points: -1, group: 'Chuyên cần & Điểm danh' },
-  { code: 'T01', name: 'Vắng có phép nhưng báo muộn', points: -2, group: 'Chuyên cần & Điểm danh' },
-  { code: 'T05', name: 'Không xác nhận thông báo/tin nhắn', points: -1, group: 'Chuyên cần & Điểm danh' },
+  { code: 'T02', name: CRITERIA_RULES.T02.name, points: CRITERIA_RULES.T02.base_points, group: 'Chuyên cần & Điểm danh' },
+  { code: 'T04', name: CRITERIA_RULES.T04.name, points: CRITERIA_RULES.T04.base_points, group: 'Chuyên cần & Điểm danh' },
+  { code: 'T01', name: CRITERIA_RULES.T01.name, points: CRITERIA_RULES.T01.base_points, group: 'Chuyên cần & Điểm danh' },
+  { code: 'T05', name: CRITERIA_RULES.T05.name, points: CRITERIA_RULES.T05.base_points, group: 'Chuyên cần & Điểm danh' },
 
   // 2. Nhiệm vụ & Sự kiện
-  { code: 'T07', name: 'Trễ deadline công việc/nhiệm vụ', points: -2, group: 'Nhiệm vụ & Sự kiện' },
-  { code: 'T03', name: 'Không tham gia hoạt động bắt buộc', points: -2, group: 'Nhiệm vụ & Sự kiện' },
-  { code: 'T06', name: 'Trang phục/tác phong không đúng chuẩn', points: -2, group: 'Nhiệm vụ & Sự kiện' },
+  { code: 'T06', name: CRITERIA_RULES.T06.name, points: CRITERIA_RULES.T06.base_points, group: 'Nhiệm vụ & Sự kiện' },
+  { code: 'T07', name: CRITERIA_RULES.T07.name, points: CRITERIA_RULES.T07.base_points, group: 'Nhiệm vụ & Sự kiện' },
+  { code: 'T08', name: CRITERIA_RULES.T08.name, points: CRITERIA_RULES.T08.base_points, group: 'Nhiệm vụ & Sự kiện' },
+  { code: 'T09', name: CRITERIA_RULES.T09.name, points: CRITERIA_RULES.T09.base_points, group: 'Nhiệm vụ & Sự kiện' },
+  { code: 'T10', name: CRITERIA_RULES.T10.name, points: CRITERIA_RULES.T10.base_points, group: 'Nhiệm vụ & Sự kiện' },
 
   // 3. Quy chế & Kỷ luật
-  { code: 'T08', name: 'Vi phạm kỷ luật/quy chế CLB', points: -5, group: 'Quy chế & Kỷ luật' },
-  { code: 'T09', name: 'Vi phạm nghiêm trọng làm ảnh hưởng CLB', points: -10, group: 'Quy chế & Kỷ luật' },
-  { code: 'T10', name: 'Tự ý phát ngôn/hành động sai lệch', points: -10, group: 'Quy chế & Kỷ luật' },
+  { code: 'T03', name: CRITERIA_RULES.T03.name, points: CRITERIA_RULES.T03.base_points, group: 'Quy chế & Kỷ luật' },
+  { code: 'T11', name: CRITERIA_RULES.T11.name, points: CRITERIA_RULES.T11.base_points, group: 'Quy chế & Kỷ luật' },
+  { code: 'T12', name: CRITERIA_RULES.T12.name, points: CRITERIA_RULES.T12.base_points, group: 'Quy chế & Kỷ luật' },
 
   // 4. Mục khác / Tự nhập linh hoạt
   { code: 'OTHER', name: 'Mục khác (Tự nhập nội dung / tiêu chí)', points: -1, group: 'Khác' },
@@ -385,11 +388,11 @@ export function DisputeModal({
 
                 <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-0.5 text-[11px]">
                   {[
-                    { id: 'ALL' as const, label: 'Tất cả (49)' },
-                    { id: 'bcn' as const, label: 'BCN (3)' },
-                    { id: 'truyen-thong' as const, label: 'Truyền thông (13)' },
-                    { id: 'tu-van' as const, label: 'Tư vấn (25)' },
-                    { id: 'nhan-su' as const, label: 'Nhân sự (8)' },
+                    { id: 'ALL' as const, label: `Tất cả (${members.length})` },
+                    { id: 'bcn' as const, label: `BCN (${members.filter((m) => m.department_slug === 'bcn').length})` },
+                    { id: 'truyen-thong' as const, label: `Truyền thông (${members.filter((m) => m.department_slug === 'truyen-thong').length})` },
+                    { id: 'tu-van' as const, label: `Tư vấn (${members.filter((m) => m.department_slug === 'tu-van').length})` },
+                    { id: 'nhan-su' as const, label: `Nhân sự (${members.filter((m) => m.department_slug === 'nhan-su').length})` },
                   ].map((tab) => (
                     <button
                       key={tab.id}

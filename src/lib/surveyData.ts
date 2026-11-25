@@ -256,7 +256,7 @@ export function deleteFeedbacksByEvent(eventName: string): SurveyFeedbackItem[] 
   }
 }
 
-// Đồng bộ dữ liệu khảo sát đa thiết bị qua Supabase Cloud API
+// Đồng bộ dữ liệu khảo sát đa thiết bị qua Supabase Cloud API và BroadcastChannel
 export function syncSurveyToCloud(payload: Record<string, any>): void {
   if (typeof window === 'undefined') return
   try {
@@ -264,7 +264,17 @@ export function syncSurveyToCloud(payload: Record<string, any>): void {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-    }).catch((e) => console.error('Survey cloud sync notice:', e))
+    })
+      .then((res) => {
+        if (res.ok && typeof BroadcastChannel !== 'undefined') {
+          try {
+            const bc = new BroadcastChannel('issac_realtime_bus')
+            bc.postMessage({ type: 'SYNC_TRIGGER' })
+            bc.close()
+          } catch {}
+        }
+      })
+      .catch((e) => console.error('Survey cloud sync notice:', e))
   } catch (err) {
     console.error('Failed to trigger survey cloud sync:', err)
   }
@@ -394,6 +404,7 @@ export function deleteSurveyEvent(id: string): SurveyEventItem[] {
     syncSurveyToCloud({
       action: 'delete_survey_event',
       surveyEventId: id,
+      surveyEventName: targetEvent?.name,
       surveyEvents: updated,
       deletedSurveyEventIds: Array.from(getDeletedSurveyEventIds()),
     })
