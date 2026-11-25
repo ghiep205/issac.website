@@ -86,7 +86,12 @@ export function isUserCoreTeam(
  */
 export function canUserManageAccounts(user: AuthUser | null): boolean {
   if (!user) return false
-  return user.role === 'bcn' || user.departmentCode === 'B04'
+  return (
+    user.role === 'bcn' ||
+    user.role === 'admin' ||
+    user.departmentCode === 'B04' ||
+    Boolean(user.roleTitle && user.roleTitle.toLowerCase().includes('chủ nhiệm'))
+  )
 }
 
 /**

@@ -36,8 +36,15 @@ function isAccountDeletedBySet(acc: any, delSet: Set<string>): boolean {
   delSet.forEach((v) => {
     if (v) lowerDel.add(String(v).toLowerCase().trim())
   })
-  const candidates = [acc.id, acc.studentId, acc.memberCode, acc.email, acc.fullName]
-  return candidates.some((val) => val && lowerDel.has(String(val).toLowerCase().trim()))
+  const candidates = [acc.id, acc.studentId, acc.memberCode, acc.email]
+  if (candidates.some((val) => val && lowerDel.has(String(val).toLowerCase().trim()))) {
+    return true
+  }
+  const fullNameClean = String(acc.fullName || acc.name || '').toLowerCase().trim()
+  if ((fullNameClean === 'trần đức thắng' || fullNameClean === 'tran duc thang') && lowerDel.has(fullNameClean)) {
+    return true
+  }
+  return false
 }
 
 async function loadSettingJson<T>(supabase: ReturnType<typeof createAdminClient>, key: string): Promise<T | null> {
@@ -854,7 +861,17 @@ export async function POST(request: Request) {
       )
     }
 
-    const shouldUpdateEvents = events !== undefined || action !== undefined
+    const EVENT_ACTIONS = new Set([
+      'delete_event',
+      'create_event',
+      'update_event',
+      'update_event_attendees',
+      'register',
+      'unregister',
+      'checkin',
+      'finalize',
+    ])
+    const shouldUpdateEvents = events !== undefined || (action !== undefined && EVENT_ACTIONS.has(action))
 
     if (shouldUpdateEvents) {
       // Nếu chưa có cachedEvents trong bộ nhớ server, tải từ Supabase trước
@@ -1319,16 +1336,24 @@ export async function POST(request: Request) {
       const activeDelAccSet = new Set(cachedDeletedAccountIds || [])
       const accMap = new Map<string, any>()
       const existingAccs = Array.isArray(cachedAccounts) && cachedAccounts.length > 0 ? cachedAccounts : INITIAL_ISSUED_ACCOUNTS
+      const existingById = new Map<string, any>()
       for (const a of existingAccs) {
         if (a?.id && !isAccountDeletedBySet(a, activeDelAccSet)) {
-          accMap.set(a.id, a)
+          existingById.set(a.id, a)
         }
       }
+      // Đưa tài khoản mới tạo / cập nhật từ client lên đầu danh sách để đồng bộ thứ tự nhất quán giữa các thiết bị
       if (Array.isArray(accounts)) {
         for (const a of accounts) {
           if (a?.id && !isAccountDeletedBySet(a, activeDelAccSet)) {
-            accMap.set(a.id, { ...(accMap.get(a.id) || {}), ...a })
+            accMap.set(a.id, { ...(existingById.get(a.id) || {}), ...a })
           }
+        }
+      }
+      // Giữ lại các tài khoản khác đang tồn tại trên server (chưa bị xóa)
+      for (const [id, existingAcc] of existingById.entries()) {
+        if (!accMap.has(id)) {
+          accMap.set(id, existingAcc)
         }
       }
       const cleanAccounts = Array.from(accMap.values())

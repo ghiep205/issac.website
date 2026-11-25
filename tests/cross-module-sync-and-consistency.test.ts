@@ -5,6 +5,7 @@ import { reconcileMemberScores } from '../src/lib/context/ClubContext'
 import { verifyClubMemberIdentity } from '../src/lib/finance/verifyMember'
 import { normalizeActivity } from '../src/components/views/ScheduleView'
 import { resolveAllAssociatedIdentities, DEFAULT_DELETED_ACCOUNT_IDS } from '../src/lib/auth/AuthContext'
+import { canUserManageAccounts } from '../src/lib/auth/permissions'
 import type { ActivityItem } from '../src/lib/scheduleData'
 
 describe('Cross-Module Data Logic & Multi-Device Sync Integrity', () => {
@@ -172,6 +173,66 @@ describe('Cross-Module Data Logic & Multi-Device Sync Integrity', () => {
     expect(normalized.timeStart).toBe('15/11')
     expect(normalized.timeEnd).toBe('15/11')
     expect(normalized.quarter).toBe('Quý 1')
+  })
+
+  it('5. canUserManageAccounts allows both role="bcn" and role="admin" alongside B04 department members', () => {
+    expect(
+      canUserManageAccounts({
+        id: 'admin-1',
+        name: 'Admin BCN',
+        role: 'admin',
+        roleTitle: 'Admin',
+        isCore: true,
+        avatarBg: 'bg-blue-600',
+      })
+    ).toBe(true)
+
+    expect(
+      canUserManageAccounts({
+        id: 'hr-1',
+        name: 'HR Head',
+        role: 'hr',
+        roleTitle: 'Trưởng Ban Nhân sự',
+        departmentCode: 'B03',
+        isCore: true,
+        avatarBg: 'bg-purple-600',
+      })
+    ).toBe(false)
+  })
+
+  it('6. Deleting an account with a common full name does not block issuing or keeping another account with the same name', () => {
+    const deletedSet = new Set<string>(['acc-haiyen', '23071317', 'haiyennguyen2504@gmail.com'])
+
+    const isBlockedByIdOrContact = (acc: { id: string; studentId?: string; email: string; fullName: string }) => {
+      const lowerSet = new Set(Array.from(deletedSet).map((s) => s.toLowerCase().trim()))
+      const fullNameClean = acc.fullName.toLowerCase().trim()
+      const isThang = fullNameClean === 'trần đức thắng' || fullNameClean === 'tran duc thang'
+      return (
+        lowerSet.has(acc.id.toLowerCase()) ||
+        (acc.studentId ? lowerSet.has(acc.studentId.toLowerCase()) : false) ||
+        lowerSet.has(acc.email.toLowerCase()) ||
+        (isThang && lowerSet.has(fullNameClean))
+      )
+    }
+
+    // Account with same Vietnamese name but distinct studentId and email remains allowed
+    const secondHaiYen = {
+      id: 'acc-1795609999999',
+      fullName: 'Nguyễn Thị Hải Yến',
+      studentId: '25070267',
+      email: 'haiyen260827@gmail.com',
+    }
+    expect(isBlockedByIdOrContact(secondHaiYen)).toBe(false)
+
+    // Deleted account itself remains strictly blocked
+    expect(
+      isBlockedByIdOrContact({
+        id: 'acc-haiyen',
+        fullName: 'Nguyễn Thị Hải Yến',
+        studentId: '23071317',
+        email: 'haiyennguyen2504@gmail.com',
+      })
+    ).toBe(true)
   })
 })
 
